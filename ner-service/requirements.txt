@@ -7,8 +7,11 @@ pydantic==2.5.3
 natasha==1.6.0
 yargy==0.16.0
 
+
 # Обработка текста
 pymorphy3==1.0.0
+pymorphy3-dicts-ru  # <-- ДОБАВИТЬ ЭТУ СТРОКУ
+
 
 # Утилиты
 python-dotenv==1.0.0
