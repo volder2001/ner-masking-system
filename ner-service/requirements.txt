@@ -1,10 +1,14 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
+# FastAPI и сервер
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+
+# NER библиотеки
 natasha==1.6.0
 yargy==0.16.0
-pymorphy2==0.9.1
-razdel==0.5.0
-fuzzywuzzy==0.18.0
-python-Levenshtein==0.23.0
-redis==5.0.1
-httpx==0.25.2
+
+# Обработка текста
+pymorphy3==1.0.0
+
+# Утилиты
+python-dotenv==1.0.0
