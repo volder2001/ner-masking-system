@@ -1,128 +1,100 @@
 """
 ner-service/main.py
-Полноценный NER-сервис для извлечения сущностей (Natasha + Yargy).
+Production-ready NER-сервис (Natasha + Yargy)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Optional
-import json
-from pathlib import Path
+from typing import List, Dict
 
-# NER библиотеки
-from natasha import (
-    Segmenter,
-    NewsMorphTagger,
-    NewsSyntaxParser,
-    NewsNERTagger,
-    NewsEmbedding, Doc
-)
-from yargy import Parser, or_
-from yargy.predicates import eq  # <-- eq перенесли сюда
+# Natasha экстракторы
+from natasha import DateExtractor, MoneyExtractor
+# Yargy для морфологического поиска
+from yargy import Parser
 from yargy.pipelines import morph_pipeline
 
 app = FastAPI(title="NER Service", version="1.0.0")
-
 
 # ==========================================
 # МОДЕЛИ ДАННЫХ
 # ==========================================
 class Entity(BaseModel):
     text: str
-    type: str  # PERSON, DATE, MONEY, ACT, NOT_ACT, SUM, SUBJECT
+    type: str  # DATE, MONEY, ACT, SUBJECT
     start_pos: int
     end_pos: int
     confidence: float = 1.0
 
-
 class NERRequest(BaseModel):
     text: str
-    dictionary_path: Optional[str] = "/app/data/dictionary.json"
-
 
 class NERResponse(BaseModel):
     entities: List[Entity]
     act_money_pairs: List[Dict]
 
+# ==========================================
+# ИНИЦИАЛИЗАЦИЯ ЭКСТРАКТОРОВ
+# ==========================================
+date_extractor = DateExtractor()
+money_extractor = MoneyExtractor()
+
+# Yargy пайплайны (находят слова в любой морфологической форме)
+act_pipeline = Parser(morph_pipeline([
+    'акт', 'акта', 'акту', 'актом', 'акте', 'акты', 'актов'
+]))
+
+subject_pipeline = Parser(morph_pipeline([
+    'квартира', 'автомобиль', 'машина', 'дом', 'земля', 'участок',
+    'гараж', 'дача', 'офис', 'помещение'
+]))
 
 # ==========================================
-# ИНИЦИАЛИЗАЦИЯ NATASHA
+# ЛОГИКА ИЗВЛЕЧЕНИЯ
 # ==========================================
-embeddings = NewsEmbedding()
-segmenter = Segmenter()
-morph_tagger = NewsMorphTagger(embeddings)
-syntax_parser = NewsSyntaxParser(embeddings)
-ner_tagger = NewsNERTagger(embeddings)
-
-
-def extract_with_natasha(text: str) -> List[Entity]:
-    doc = Doc(text)
-    doc.segment(segmenter)
-    doc.tag_morph(morph_tagger)
-    doc.parse_syntax(syntax_parser)
-    doc.tag_ner(ner_tagger)
-
-    entities = []
-    for span in doc.spans:
-        if span.type in ['PER', 'DATE', 'MONEY']:
-            entities.append(Entity(
-                text=span.text, type=span.type,
-                start_pos=span.start, end_pos=span.stop, confidence=0.9
-            ))
-    return entities
-
-
-# ==========================================
-# YARGY: ПОИСК ПО СЛОВАРЮ И МОРФОЛОГИИ
-# ==========================================
-def extract_with_yargy(text: str, dictionary: dict) -> List[Entity]:
-    entities = []
-    # Приводим текст к нижнему регистру для поиска, но позиции символов останутся теми же
-    text_lower = text.lower()
-
-    for entity_type, variants in dictionary.items():
-        rule_pattern = or_(*[eq(variant.lower()) for variant in variants])
-        parser = Parser(rule_pattern)
-
-        # ИСПОЛЬЗУЕМ findall ВМЕСТО finditer
-        for match in parser.findall(text_lower):
-            start = match.span.start
-            stop = match.span.stop
-            entities.append(Entity(
-                text=text[start:stop],  # Берем текст из оригинала, чтобы сохранить регистр
-                type=entity_type,
-                start_pos=start,
-                end_pos=stop,
-                confidence=0.95
-            ))
-    return entities
-
-
-def extract_subjects_morph(text: str) -> List[Entity]:
-    subjects = ['квартира', 'автомобиль', 'машина', 'дом', 'земля', 'участок', 'гараж', 'дача', 'офис']
-    parser = Parser(morph_pipeline(subjects))
+def extract_entities(text: str) -> List[Entity]:
     entities = []
 
-    # ИСПОЛЬЗУЕМ findall ВМЕСТО finditer
-    for match in parser.findall(text):
-        start = match.span.start
-        stop = match.span.stop
+    # 1. Даты (Natasha)
+    for match in date_extractor(text):
         entities.append(Entity(
-            text=text[start:stop],
-            type='SUBJECT',
-            start_pos=start,
-            end_pos=stop,
-            confidence=0.85
+            text=match.text, type='DATE',
+            start_pos=match.start, end_pos=match.stop, confidence=0.95
         ))
-    return entities
 
-# ==========================================
-# СВЯЗЫВАНИЕ ACT-MONEY
-# ==========================================
+    # 2. Деньги (Natasha)
+    for match in money_extractor(text):
+        entities.append(Entity(
+            text=match.text, type='MONEY',
+            start_pos=match.start, end_pos=match.stop, confidence=0.95
+        ))
+
+    # 3. Акты (Yargy)
+    for match in act_pipeline.findall(text):
+        entities.append(Entity(
+            text=text[match.span.start:match.span.stop], type='ACT',
+            start_pos=match.span.start, end_pos=match.span.stop, confidence=0.95
+        ))
+
+    # 4. Предметы взыскания (Yargy)
+    for match in subject_pipeline.findall(text):
+        entities.append(Entity(
+            text=text[match.span.start:match.span.stop], type='SUBJECT',
+            start_pos=match.span.start, end_pos=match.span.stop, confidence=0.85
+        ))
+
+    # Удаляем дубликаты по позициям (если Natasha и Yargy нашли одно и то же)
+    unique_entities = {}
+    for e in entities:
+        key = (e.start_pos, e.end_pos)
+        if key not in unique_entities:
+            unique_entities[key] = e
+
+    return list(unique_entities.values())
+
 def link_act_money_pairs(entities: List[Entity], text: str) -> List[Dict]:
     pairs = []
     sentences = text.replace('\n', ' ').split('.')
-    act_entities = [e for e in entities if e.type in ['ACT', 'NOT_ACT']]
-    money_entities = [e for e in entities if e.type in ['MONEY', 'SUM']]
+    act_entities = [e for e in entities if e.type == 'ACT']
+    money_entities = [e for e in entities if e.type == 'MONEY']
 
     for act in act_entities:
         for money in money_entities:
@@ -134,15 +106,17 @@ def link_act_money_pairs(entities: List[Entity], text: str) -> List[Dict]:
                 if start <= money.start_pos < end: money_idx = idx
                 current_pos = end + 1
 
-            if act_idx == money_idx and money.start_pos > act.start_pos and (money.start_pos - act.end_pos) < 100:
+            # Если в одном предложении и деньги идут после акта (не дальше 100 символов)
+            if (act_idx == money_idx and money.start_pos > act.start_pos and
+                (money.start_pos - act.end_pos) < 100):
                 pairs.append({
-                    'act': act.dict(), 'money': money.dict(),
+                    'act': act.model_dump(),
+                    'money': money.model_dump(),
                     'distance': money.start_pos - act.end_pos,
                     'context': text[act.start_pos:min(money.end_pos + 30, len(text))]
                 })
-                break
+                break # Берем только ближайшее MONEY
     return pairs
-
 
 # ==========================================
 # API ENDPOINTS
@@ -151,36 +125,15 @@ def link_act_money_pairs(entities: List[Entity], text: str) -> List[Dict]:
 def read_root():
     return {"status": "ok", "service": "ner-service", "version": "1.0.0"}
 
-
 @app.post("/extract", response_model=NERResponse)
-def extract_entities(request: NERRequest):
+def extract(request: NERRequest):
     try:
-        natasha_entities = extract_with_natasha(request.text)
-
-        dictionary = {}
-        if request.dictionary_path and Path(request.dictionary_path).exists():
-            with open(request.dictionary_path, 'r', encoding='utf-8') as f:
-                dictionary = json.load(f)
-
-        dict_entities = extract_with_yargy(request.text, dictionary)
-        subject_entities = extract_subjects_morph(request.text)
-
-        # Объединяем и удаляем дубликаты по позиции
-        all_entities = {}
-        for entity in natasha_entities + dict_entities + subject_entities:
-            key = (entity.start_pos, entity.end_pos)
-            if key not in all_entities:
-                all_entities[key] = entity
-
-        entities_list = list(all_entities.values())
-        act_money_pairs = link_act_money_pairs(entities_list, request.text)
-
-        return NERResponse(entities=entities_list, act_money_pairs=act_money_pairs)
+        entities = extract_entities(request.text)
+        act_money_pairs = link_act_money_pairs(entities, request.text)
+        return NERResponse(entities=entities, act_money_pairs=act_money_pairs)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8002)
