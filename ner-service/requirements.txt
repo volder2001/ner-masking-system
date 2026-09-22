@@ -12,3 +12,4 @@ pymorphy3==1.0.0
 
 # Утилиты
 python-dotenv==1.0.0
+setuptools
