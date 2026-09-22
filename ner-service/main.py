@@ -77,27 +77,33 @@ def extract_with_natasha(text: str) -> List[Entity]:
 def extract_with_yargy(text: str, dictionary: dict) -> List[Entity]:
     entities = []
     for entity_type, variants in dictionary.items():
-        rule_pattern = or_(*[eq(variant.lower()) for variant in variants]).label(entity_type)
+        # Создаем правило БЕЗ .label()
+        rule_pattern = or_(*[eq(variant.lower()) for variant in variants])
         parser = Parser(rule_pattern)
         for match in parser.finditer(text.lower()):
             entities.append(Entity(
-                text=match.text, type=entity_type,
-                start_pos=match.start, end_pos=match.start + len(match.text), confidence=0.95
+                text=match.text,
+                type=entity_type,  # <-- Присваиваем тип вручную здесь
+                start_pos=match.start,
+                end_pos=match.start + len(match.text),
+                confidence=0.95
             ))
     return entities
 
-
 def extract_subjects_morph(text: str) -> List[Entity]:
     subjects = ['квартира', 'автомобиль', 'машина', 'дом', 'земля', 'участок', 'гараж', 'дача', 'офис']
-    parser = Parser(morph_pipeline(subjects).label('SUBJECT'))
+    # Создаем пайплайн БЕЗ .label()
+    parser = Parser(morph_pipeline(subjects))
     entities = []
     for match in parser.finditer(text):
         entities.append(Entity(
-            text=match.text, type='SUBJECT',
-            start_pos=match.start, end_pos=match.start + len(match.text), confidence=0.85
+            text=match.text,
+            type='SUBJECT',      # <-- Присваиваем тип вручную здесь
+            start_pos=match.start,
+            end_pos=match.start + len(match.text),
+            confidence=0.85
         ))
     return entities
-
 
 # ==========================================
 # СВЯЗЫВАНИЕ ACT-MONEY
