@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-OPTIMIZED: Yargy morph_pipeline + Лемматизация фраз для маппинга в категории
+FINAL OPTIMIZED: Yargy native .normalized() interpretation для идеальной лемматизации фраз
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -13,6 +13,7 @@ from natasha import MorphVocab, MoneyExtractor, DatesExtractor
 from yargy import Parser, rule, or_
 from yargy.pipelines import morph_pipeline
 from yargy.predicates import gram
+from yargy.interpretation import fact  # <-- ИМПОРТ ДЛЯ НОРМАЛИЗАЦИИ
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
@@ -22,7 +23,7 @@ app = FastAPI(title="NER Service", version="1.0.0")
 morph_vocab = MorphVocab()
 money_extractor = MoneyExtractor(morph_vocab)
 date_extractor = DatesExtractor(morph_vocab)
-morph = pymorphy3.MorphAnalyzer()
+morph = pymorphy3.MorphAnalyzer() # Оставляем только для fallback, если понадобится
 
 # Строгий парсер имен (ФИО, Ф.И.О., И.О.Ф.)
 RULE_FIO = rule(gram('Surn'), gram('Name'), gram('Patr'))
@@ -30,32 +31,39 @@ RULE_FIO_INIT = rule(gram('Surn'), gram('Abbr'), gram('Abbr'))
 RULE_IOF = rule(gram('Name'), gram('Patr'), gram('Surn'))
 NAME_PARSER = Parser(or_(RULE_FIO, RULE_FIO_INIT, RULE_IOF))
 
-# Загрузка словаря и построение маппинга
+# Загрузка словаря
 DICT_PATH = Path("/app/data/dictionary.json")
-def load_dictionary_and_build_mapping():
+def load_dictionary():
     if DICT_PATH.exists():
         with open(DICT_PATH, 'r', encoding='utf-8') as f:
-            raw_dict = json.load(f)
-    else:
-        raw_dict = {"ACT": ["акт"], "SUBJECT": ["квартира"]}
+            return json.load(f)
+    return {"ACT": ["акт"], "SUBJECT": ["квартира"]}
 
-    # Маппинг: "лемма фразы" -> "КАТЕГОРИЯ"
-    phrase_to_category = {}
-    all_phrases = []
+dictionary = load_dictionary()
 
-    for category, phrases in raw_dict.items():
-        for phrase in phrases:
-            # Приводим фразу из словаря к нижнему регистру для надежного маппинга
-            normalized_phrase = phrase.lower().strip()
-            phrase_to_category[normalized_phrase] = category
-            all_phrases.append(normalized_phrase)
+# ==========================================
+# YARGY INTERPRETATION ДЛЯ СЛОВАРЯ (ТВОЕ РЕШЕНИЕ!)
+# ==========================================
+# Создаем факт, который будет хранить нормализованный текст и категорию
+DictEntity = fact(
+    'DictEntity',
+    ['text', 'category']
+)
 
-    return raw_dict, phrase_to_category, all_phrases
+# Динамически строим правила для каждой категории
+dict_rules = []
+for category, phrases in dictionary.items():
+    # morph_pipeline находит любую форму фразы.
+    # .interpretation автоматически нормализует найденный текст (.normalized())
+    # и присваивает ему константную категорию (.const(category))
+    interpreted_rule = morph_pipeline(phrases).interpretation(
+        DictEntity.text.normalized(),
+        DictEntity.category.const(category)
+    )
+    dict_rules.append(interpreted_rule)
 
-dictionary, phrase_to_category, all_phrases = load_dictionary_and_build_mapping()
-
-# ОДИН парсер для всех выражений из словаря
-DICTIONARY_PARSER = Parser(morph_pipeline(all_phrases))
+# Объединяем все правила через ИЛИ
+DICT_PARSER = Parser(or_(*dict_rules))
 
 # ==========================================
 # 2. МОДЕЛИ ДАННЫХ
@@ -82,10 +90,13 @@ class NERResponse(BaseModel):
 def extract_entities(text: str) -> List[Entity]:
     entities = []
 
-    def add_entity(word: str, entity_type: str, start: int, end: int, conf: float, currency: str = None):
-        normal = word if entity_type.startswith('MONEY') or entity_type == 'DATE' else morph.parse(word)[0].normal_form
+    def add_entity(word: str, entity_type: str, start: int, end: int, conf: float, currency: str = None, normal_form: str = None):
+        # Если normal_form передан явно (от Yargy), используем его. Иначе вычисляем.
+        if normal_form is None:
+            normal_form = word if entity_type.startswith('MONEY') or entity_type == 'DATE' else morph.parse(word)[0].normal_form
+
         entities.append(Entity(
-            text=word, normal_form=normal, type=entity_type,
+            text=word, normal_form=normal_form, type=entity_type,
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
@@ -102,21 +113,22 @@ def extract_entities(text: str) -> List[Entity]:
     for match in NAME_PARSER.findall(text):
         add_entity(text[match.span.start:match.span.stop], 'NAME', match.span.start, match.span.stop, 0.95)
 
-    # 4. СЛОВАРЬ (ОПТИМИЗИРОВАННЫЙ ПОДХОД)
-    for match in DICTIONARY_PARSER.findall(text):
-        matched_text = text[match.span.start:match.span.stop]
+    # 4. СЛОВАРЬ (YARGY NATIVE NORMALIZATION)
+    for match in DICT_PARSER.findall(text):
+        # match.fact.text УЖЕ содержит нормализованную форму благодаря .normalized()!
+        # match.fact.category содержит нашу метку (ACT, SUBJECT и т.д.)
+        original_text = text[match.span.start:match.span.stop]
 
-        # Лемматизируем каждое слово в найденной фразе и склеиваем обратно
-        lemmas = [morph.parse(w)[0].normal_form.lower() for w in matched_text.split()]
-        lemma_phrase = " ".join(lemmas)
+        add_entity(
+            word=original_text,
+            entity_type=match.fact.category,
+            start=match.span.start,
+            end=match.span.stop,
+            conf=0.9,
+            normal_form=match.fact.text  # <-- БЕРЕМ НОРМАЛЬНУЮ ФОРМУ ПРЯМО ИЗ YARGY!
+        )
 
-        # Ищем в маппинге
-        if lemma_phrase in phrase_to_category:
-            category = phrase_to_category[lemma_phrase]
-            add_entity(matched_text, category, match.span.start, match.span.stop, 0.90)
-
-    # ГАРАНТИРОВАННАЯ ДЕДУПЛИКАЦИЯ: оставляем только уникальные (start, end)
-    # Сортируем по длине (desc), чтобы длинные фразы ("кадастровый номер") побеждали короткие
+    # ГАРАНТИРОВАННАЯ ДЕДУПЛИКАЦИЯ
     unique_entities = {}
     for e in sorted(entities, key=lambda x: (x.end_pos - x.start_pos), reverse=True):
         unique_entities[(e.start_pos, e.end_pos)] = e
@@ -154,12 +166,7 @@ def link_act_money_pairs(entities: List[Entity], text: str) -> List[Dict]:
 # ==========================================
 @app.get("/")
 def read_root():
-    return {
-        "status": "ok",
-        "service": "ner-service",
-        "dict_loaded_total": len(dictionary),
-        "phrases_in_pipeline": all_phrases
-    }
+    return {"status": "ok", "service": "ner-service", "dict_loaded_total": len(dictionary)}
 
 @app.post("/extract", response_model=NERResponse)
 def extract(request: NERRequest):
