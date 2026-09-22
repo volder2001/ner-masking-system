@@ -16,7 +16,8 @@ from natasha import (
     NewsNERTagger,
     NewsEmbedding, Doc
 )
-from yargy import Parser, or_, eq
+from yargy import Parser, or_
+from yargy.predicates import eq  # <-- eq перенесли сюда
 from yargy.pipelines import morph_pipeline
 
 app = FastAPI(title="NER Service", version="1.0.0")
