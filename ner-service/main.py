@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION: Глобальная минимальная дистанция для пар + Фильтр латиницы в именах
+FINAL PRODUCTION: Направленная дистанция для пар (Money всегда после Subject) + Фильтр латиницы
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -32,12 +32,6 @@ ADDRESS_MARKERS: Set[str] = {
     'ул', 'пр', 'д', 'кв', 'г', 'пер', 'бул', 'ш',
     'обл.', 'область', 'р-н', 'район', 'с.', 'село', 'п.', 'поселок',
     'мкр.', 'микрорайон', 'наб.', 'набережная', 'туп.', 'тупик'
-}
-
-PREPOSITIONS: Set[str] = {
-    'за', 'по', 'на', 'в', 'с', 'к', 'у', 'о', 'об', 'от', 'до',
-    'из', 'под', 'над', 'через', 'между', 'при', 'без', 'для', 'про',
-    'а', 'и', 'но', 'или', 'же', 'бы', 'ли', 'то'
 }
 
 DICT_PATH = Path("/app/data/dictionary.json")
@@ -144,7 +138,7 @@ def extract_entities(text: str) -> List[Entity]:
         word = text[match.start:match.stop]
         if len(word.split()) >= 2:
             if not is_address_context(text, match.start):
-                # НОВОЕ: Отбрасываем, если есть латинские буквы (защита от OCR-мусора типа "Qe Л.И.")
+                # Отбрасываем, если есть латинские буквы (защита от OCR-мусора типа "Qe Л.И.")
                 if not any(char.isascii() and char.isalpha() for char in word):
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
@@ -173,18 +167,24 @@ def extract_entities(text: str) -> List[Entity]:
 
 def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
     """
-    Алгоритм "Глобальной минимальной дистанции".
-    Отдает приоритет самым близким парам, решая проблему перехвата денег общими фразами.
+    Алгоритм "Направленной минимальной дистанции".
+    Учитывает, что в юр. текстах СУММА почти всегда идет ПОСЛЕ ПРЕДМЕТА.
     """
     subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
     WINDOW_SIZE = 150
 
-    # 1. Генерируем все возможные валидные пары в пределах окна
     candidates = []
     for subj in subjects:
         for money in money_entities:
-            distance = abs(money.start_pos - subj.end_pos)
+            # Расстояние от конца SUBJECT до начала MONEY
+            distance = money.start_pos - subj.end_pos
+
+            # Если MONEY идет ДО SUBJECT, даем огромный штраф (9999)
+            # Это предотвращает кражу денег последующим SUBJECT у предыдущего
+            if distance < 0:
+                distance = 9999
+
             if distance <= WINDOW_SIZE:
                 candidates.append({
                     'subject': subj,
@@ -192,10 +192,9 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
                     'distance': distance
                 })
 
-    # 2. Сортируем кандидатов по дистанции (от самых близких к дальним)
+    # Сортируем по дистанции (от самых близких к дальним)
     candidates.sort(key=lambda x: x['distance'])
 
-    # 3. Жадно выбираем лучшие непересекающиеся пары
     used_subjects = set()
     used_moneys = set()
     final_pairs = []
@@ -219,7 +218,7 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
                 context=context
             ))
 
-    # 4. Добавляем SUBJECT-ы, которые остались без пар (money = null)
+    # Добавляем SUBJECT-ы, которые остались без пар
     for subj in subjects:
         subj_id = (subj.start_pos, subj.end_pos)
         if subj_id not in used_subjects:
@@ -230,7 +229,6 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
                 context=None
             ))
 
-    # Сортируем итоговые пары по порядку появления SUBJECT в тексте
     final_pairs.sort(key=lambda x: x.subject.start_pos)
     return final_pairs
 
