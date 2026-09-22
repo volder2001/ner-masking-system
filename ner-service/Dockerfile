@@ -1,11 +1,12 @@
-FROM python:3.12-slim
+# ВАЖНО: Используем Python 3.10, так как Natasha и её зависимости стабильны именно на нем
+FROM python:3.10-slim
 
 WORKDIR /app
 
-# 1. ГАРАНТИРОВАННО обновляем pip и ставим setuptools ПЕРВЫМ ДЕЛОМ
-RUN pip install --no-cache-dir --upgrade pip setuptools
+# 1. Принудительно ставим версию setuptools, где pkg_resources ЕЩЁ существует
+RUN pip install --no-cache-dir --upgrade pip "setuptools<70.0.0"
 
-# 2. Устанавливаем системные зависимости
+# 2. Системные зависимости для компиляции
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
