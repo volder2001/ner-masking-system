@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL OPTIMIZED: Yargy native .normalized() interpretation для идеальной лемматизации фраз
+FINAL: Yargy native .normalized() + Python mapping для категории (без TypeError)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -13,7 +13,7 @@ from natasha import MorphVocab, MoneyExtractor, DatesExtractor
 from yargy import Parser, rule, or_
 from yargy.pipelines import morph_pipeline
 from yargy.predicates import gram
-from yargy.interpretation import fact  # <-- ИМПОРТ ДЛЯ НОРМАЛИЗАЦИИ
+from yargy.interpretation import fact
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
@@ -23,9 +23,9 @@ app = FastAPI(title="NER Service", version="1.0.0")
 morph_vocab = MorphVocab()
 money_extractor = MoneyExtractor(morph_vocab)
 date_extractor = DatesExtractor(morph_vocab)
-morph = pymorphy3.MorphAnalyzer() # Оставляем только для fallback, если понадобится
+morph = pymorphy3.MorphAnalyzer()
 
-# Строгий парсер имен (ФИО, Ф.И.О., И.О.Ф.)
+# Строгий парсер имен
 RULE_FIO = rule(gram('Surn'), gram('Name'), gram('Patr'))
 RULE_FIO_INIT = rule(gram('Surn'), gram('Abbr'), gram('Abbr'))
 RULE_IOF = rule(gram('Name'), gram('Patr'), gram('Surn'))
@@ -42,28 +42,20 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# YARGY INTERPRETATION ДЛЯ СЛОВАРЯ (ТВОЕ РЕШЕНИЕ!)
+# YARGY INTERPRETATION + PYTHON MAPPING
 # ==========================================
-# Создаем факт, который будет хранить нормализованный текст и категорию
-DictEntity = fact(
-    'DictEntity',
-    ['text', 'category']
-)
-
-# Динамически строим правила для каждой категории
-dict_rules = []
+# 1. Создаем маппинг: нормализованная фраза -> категория
+phrase_to_category = {}
+all_phrases = []
 for category, phrases in dictionary.items():
-    # morph_pipeline находит любую форму фразы.
-    # .interpretation автоматически нормализует найденный текст (.normalized())
-    # и присваивает ему константную категорию (.const(category))
-    interpreted_rule = morph_pipeline(phrases).interpretation(
-        DictEntity.text.normalized(),
-        DictEntity.category.const(category)
-    )
-    dict_rules.append(interpreted_rule)
+    for phrase in phrases:
+        phrase_to_category[phrase.lower()] = category
+        all_phrases.append(phrase)
 
-# Объединяем все правила через ИЛИ
-DICT_PARSER = Parser(or_(*dict_rules))
+# 2. Создаем ОДИН парсер, который возвращает нормализованный текст (твое решение!)
+DictEntity = fact('DictEntity', ['text'])
+DICT_RULE = morph_pipeline(all_phrases).interpretation(DictEntity.text.normalized())
+DICT_PARSER = Parser(DICT_RULE)
 
 # ==========================================
 # 2. МОДЕЛИ ДАННЫХ
@@ -91,7 +83,6 @@ def extract_entities(text: str) -> List[Entity]:
     entities = []
 
     def add_entity(word: str, entity_type: str, start: int, end: int, conf: float, currency: str = None, normal_form: str = None):
-        # Если normal_form передан явно (от Yargy), используем его. Иначе вычисляем.
         if normal_form is None:
             normal_form = word if entity_type.startswith('MONEY') or entity_type == 'DATE' else morph.parse(word)[0].normal_form
 
@@ -113,19 +104,22 @@ def extract_entities(text: str) -> List[Entity]:
     for match in NAME_PARSER.findall(text):
         add_entity(text[match.span.start:match.span.stop], 'NAME', match.span.start, match.span.stop, 0.95)
 
-    # 4. СЛОВАРЬ (YARGY NATIVE NORMALIZATION)
+    # 4. СЛОВАРЬ (YARGY NATIVE NORMALIZATION + MAPPING)
     for match in DICT_PARSER.findall(text):
-        # match.fact.text УЖЕ содержит нормализованную форму благодаря .normalized()!
-        # match.fact.category содержит нашу метку (ACT, SUBJECT и т.д.)
         original_text = text[match.span.start:match.span.stop]
+        # match.fact.text УЖЕ содержит идеальную нормальную форму благодаря .normalized()!
+        normalized_text = match.fact.text.lower()
+
+        # Берем категорию из нашего маппинга
+        category = phrase_to_category.get(normalized_text, 'SUBJECT')
 
         add_entity(
             word=original_text,
-            entity_type=match.fact.category,
+            entity_type=category,
             start=match.span.start,
             end=match.span.stop,
             conf=0.9,
-            normal_form=match.fact.text  # <-- БЕРЕМ НОРМАЛЬНУЮ ФОРМУ ПРЯМО ИЗ YARGY!
+            normal_form=normalized_text # <-- БЕРЕМ НОРМАЛЬНУЮ ФОРМУ ПРЯМО ИЗ YARGY!
         )
 
     # ГАРАНТИРОВАННАЯ ДЕДУПЛИКАЦИЯ
