@@ -1,10 +1,11 @@
 """
 ner-service/main.py
-Production-ready NER-сервис (Natasha + Yargy)
+Production-ready NER-сервис с лемматизацией (Natasha + Yargy + Pymorphy3)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict
+import pymorphy3
 
 # Natasha экстракторы
 from natasha import DateExtractor, MoneyExtractor
@@ -14,12 +15,16 @@ from yargy.pipelines import morph_pipeline
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
+# Инициализируем морфологический анализатор (загружается один раз при старте)
+morph = pymorphy3.MorphAnalyzer()
+
 # ==========================================
 # МОДЕЛИ ДАННЫХ
 # ==========================================
 class Entity(BaseModel):
     text: str
-    type: str  # DATE, MONEY, ACT, SUBJECT
+    normal_form: str  # <-- НОВОЕ ПОЛЕ: нормальная форма слова
+    type: str         # DATE, MONEY, ACT, SUBJECT
     start_pos: int
     end_pos: int
     confidence: float = 1.0
@@ -37,7 +42,6 @@ class NERResponse(BaseModel):
 date_extractor = DateExtractor()
 money_extractor = MoneyExtractor()
 
-# Yargy пайплайны (находят слова в любой морфологической форме)
 act_pipeline = Parser(morph_pipeline([
     'акт', 'акта', 'акту', 'актом', 'акте', 'акты', 'актов'
 ]))
@@ -53,35 +57,38 @@ subject_pipeline = Parser(morph_pipeline([
 def extract_entities(text: str) -> List[Entity]:
     entities = []
 
+    # Вспомогательная функция для создания сущности с лемматизацией
+    def add_entity(word: str, entity_type: str, start: int, end: int, conf: float):
+        # Получаем нормальную форму (лемму)
+        normal = morph.parse(word)[0].normal_form
+        entities.append(Entity(
+            text=word,
+            normal_form=normal,
+            type=entity_type,
+            start_pos=start,
+            end_pos=end,
+            confidence=conf
+        ))
+
     # 1. Даты (Natasha)
     for match in date_extractor(text):
-        entities.append(Entity(
-            text=match.text, type='DATE',
-            start_pos=match.start, end_pos=match.stop, confidence=0.95
-        ))
+        add_entity(match.text, 'DATE', match.start, match.stop, 0.95)
 
     # 2. Деньги (Natasha)
     for match in money_extractor(text):
-        entities.append(Entity(
-            text=match.text, type='MONEY',
-            start_pos=match.start, end_pos=match.stop, confidence=0.95
-        ))
+        add_entity(match.text, 'MONEY', match.start, match.stop, 0.95)
 
     # 3. Акты (Yargy)
     for match in act_pipeline.findall(text):
-        entities.append(Entity(
-            text=text[match.span.start:match.span.stop], type='ACT',
-            start_pos=match.span.start, end_pos=match.span.stop, confidence=0.95
-        ))
+        word = text[match.span.start:match.span.stop]
+        add_entity(word, 'ACT', match.span.start, match.span.stop, 0.95)
 
     # 4. Предметы взыскания (Yargy)
     for match in subject_pipeline.findall(text):
-        entities.append(Entity(
-            text=text[match.span.start:match.span.stop], type='SUBJECT',
-            start_pos=match.span.start, end_pos=match.span.stop, confidence=0.85
-        ))
+        word = text[match.span.start:match.span.stop]
+        add_entity(word, 'SUBJECT', match.span.start, match.span.stop, 0.85)
 
-    # Удаляем дубликаты по позициям (если Natasha и Yargy нашли одно и то же)
+    # Удаляем дубликаты по позициям
     unique_entities = {}
     for e in entities:
         key = (e.start_pos, e.end_pos)
@@ -106,16 +113,15 @@ def link_act_money_pairs(entities: List[Entity], text: str) -> List[Dict]:
                 if start <= money.start_pos < end: money_idx = idx
                 current_pos = end + 1
 
-            # Если в одном предложении и деньги идут после акта (не дальше 100 символов)
             if (act_idx == money_idx and money.start_pos > act.start_pos and
-                (money.start_pos - act.end_pos) < 100):
+                (money.start_pos - act.end_pos) < 150): # Увеличил дистанцию до 150 для надежности
                 pairs.append({
                     'act': act.model_dump(),
                     'money': money.model_dump(),
                     'distance': money.start_pos - act.end_pos,
-                    'context': text[act.start_pos:min(money.end_pos + 30, len(text))]
+                    'context': text[act.start_pos:min(money.end_pos + 40, len(text))]
                 })
-                break # Берем только ближайшее MONEY
+                break
     return pairs
 
 # ==========================================
