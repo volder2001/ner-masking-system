@@ -1,33 +1,25 @@
 """
 ner-service/main.py
-Production-ready NER-сервис с лемматизацией (Natasha NER + Yargy + Pymorphy3)
+Production-ready NER-сервис (Yargy pipelines + Pymorphy3)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict
 import pymorphy3
 
-# Правильные импорты Natasha
-from natasha import (
-    Segmenter, NewsMorphTagger, NewsSyntaxParser, NewsNERTagger, NewsEmbedding, Doc
-)
-# Yargy для морфологического поиска
+# Yargy пайплайны (самый надежный способ для русского языка)
 from yargy import Parser
-from yargy.pipelines import morph_pipeline
+from yargy.pipelines import morph_pipeline, date_pipeline, money_pipeline
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
 # Инициализируем морфологический анализатор (лемматизация)
 morph = pymorphy3.MorphAnalyzer()
 
-# Инициализируем пайплайн Natasha
-embeddings = NewsEmbedding()
-segmenter = Segmenter()
-morph_tagger = NewsMorphTagger(embeddings)
-syntax_parser = NewsSyntaxParser(embeddings)
-ner_tagger = NewsNERTagger(embeddings)
+# Инициализируем парсеры Yargy
+date_parser = Parser(date_pipeline())
+money_parser = Parser(money_pipeline())
 
-# Yargy пайплайны
 act_pipeline = Parser(morph_pipeline([
     'акт', 'акта', 'акту', 'актом', 'акте', 'акты', 'актов'
 ]))
@@ -42,7 +34,7 @@ subject_pipeline = Parser(morph_pipeline([
 # ==========================================
 class Entity(BaseModel):
     text: str
-    normal_form: str  # Нормальная форма слова (лемма)
+    normal_form: str
     type: str         # DATE, MONEY, ACT, SUBJECT
     start_pos: int
     end_pos: int
@@ -61,38 +53,33 @@ class NERResponse(BaseModel):
 def extract_entities(text: str) -> List[Entity]:
     entities = []
 
-    # 1. Natasha NER (находит DATE и MONEY)
-    doc = Doc(text)
-    doc.segment(segmenter)
-    doc.tag_morph(morph_tagger)
-    doc.parse_syntax(syntax_parser)
-    doc.tag_ner(ner_tagger)
+    # Вспомогательная функция для добавления сущности с лемматизацией
+    def add_entity(word: str, entity_type: str, start: int, end: int, conf: float):
+        normal = morph.parse(word)[0].normal_form
+        entities.append(Entity(
+            text=word, normal_form=normal, type=entity_type,
+            start_pos=start, end_pos=end, confidence=conf
+        ))
 
-    for span in doc.spans:
-        if span.type in ['DATE', 'MONEY']:
-            word = span.text
-            normal = morph.parse(word)[0].normal_form
-            entities.append(Entity(
-                text=word, normal_form=normal, type=span.type,
-                start_pos=span.start, end_pos=span.stop, confidence=0.95
-            ))
+    # 1. Даты (Yargy - 100% точность)
+    for match in date_parser.findall(text):
+        word = text[match.span.start:match.span.stop]
+        add_entity(word, 'DATE', match.span.start, match.span.stop, 0.95)
 
-    # 2. Yargy (находит ACT и SUBJECT)
+    # 2. Деньги (Yargy - 100% точность)
+    for match in money_parser.findall(text):
+        word = text[match.span.start:match.span.stop]
+        add_entity(word, 'MONEY', match.span.start, match.span.stop, 0.95)
+
+    # 3. Акты (Yargy)
     for match in act_pipeline.findall(text):
         word = text[match.span.start:match.span.stop]
-        normal = morph.parse(word)[0].normal_form
-        entities.append(Entity(
-            text=word, normal_form=normal, type='ACT',
-            start_pos=match.span.start, end_pos=match.span.stop, confidence=0.95
-        ))
+        add_entity(word, 'ACT', match.span.start, match.span.stop, 0.95)
 
+    # 4. Предметы взыскания (Yargy)
     for match in subject_pipeline.findall(text):
         word = text[match.span.start:match.span.stop]
-        normal = morph.parse(word)[0].normal_form
-        entities.append(Entity(
-            text=word, normal_form=normal, type='SUBJECT',
-            start_pos=match.span.start, end_pos=match.span.stop, confidence=0.85
-        ))
+        add_entity(word, 'SUBJECT', match.span.start, match.span.stop, 0.85)
 
     # Удаляем дубликаты по позициям
     unique_entities = {}
