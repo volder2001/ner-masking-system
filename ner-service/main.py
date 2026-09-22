@@ -1,6 +1,7 @@
 """
 ner-service/main.py
 ULTIMATE: Гибридный подход (NamesExtractor + фильтр длины, DatesExtractor + Regex для кавычек, Yargy normalized)
+Алгоритм "Окна контекста" для связывания SUBJECT-MONEY (любой порядок, устойчив к пропускам)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -32,11 +33,11 @@ def load_dictionary():
     if DICT_PATH.exists():
         with open(DICT_PATH, 'r', encoding='utf-8') as f:
             return json.load(f)
-    return {"ACT": ["акт"], "SUBJECT": ["квартира"]}
+    return {"SUBJECT": ["квартира"], "NOT_SUBJECT": ["отсутствует акт"]}
 
 dictionary = load_dictionary()
 
-# Yargy для словаря (с твоей гениальной лемматизацией через .normalized())
+# Yargy для словаря (с лемматизацией через .normalized())
 phrase_to_category = {}
 all_phrases = []
 for category, phrases in dictionary.items():
@@ -66,12 +67,18 @@ class Entity(BaseModel):
     end_pos: int
     confidence: float = 1.0
 
+class SubjectMoneyPair(BaseModel):
+    subject: Entity
+    money: Optional[Entity] = None  # Может быть null, если сумма не найдена
+    distance: Optional[int] = None  # Расстояние в символах (может быть null)
+    context: Optional[str] = None   # Контекст из текста (может быть null)
+
 class NERRequest(BaseModel):
     text: str
 
 class NERResponse(BaseModel):
     entities: List[Entity]
-    act_money_pairs: List[Dict]
+    subject_money_pairs: List[SubjectMoneyPair]
 
 # ==========================================
 # 3. ЛОГИКА ИЗВЛЕЧЕНИЯ
@@ -88,13 +95,13 @@ def extract_entities(text: str) -> List[Entity]:
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
-    # 1. ДЕНЬГИ (ИСПРАВЛЕНО: text[match.start:match.stop] вместо match.text)
+    # 1. ДЕНЬГИ
     for match in money_extractor(text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
             word = text[match.start:match.stop]
             add_entity(word, f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
 
-    # 2. ДАТЫ (ИСПРАВЛЕНО: text[match.start:match.stop] вместо match.text)
+    # 2. ДАТЫ (Гибрид: Natasha + Regex)
     for match in date_extractor(text):
         word = text[match.start:match.stop]
         add_entity(word, 'DATE', match.start, match.stop, 0.95)
@@ -103,17 +110,15 @@ def extract_entities(text: str) -> List[Entity]:
         for match in pattern.finditer(text):
             add_entity(match.group(0), 'DATE', match.start(), match.end(), 0.95)
 
-    # 3. ИМЕНА (ИСПРАВЛЕНО: text[match.start:match.stop] вместо match.text)
+    # 3. ИМЕНА (NamesExtractor + фильтр длины >= 2 слов)
     for match in names_extractor(text):
         word = text[match.start:match.stop]
-        # Оставляем только имена из 2 и более слов. Отсекает мусор, оставляет "Каграмамов Борис Николаевич" и "Петросян В.С."
         if len(word.split()) >= 2:
             add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (ТВОЙ ПОДХОД: YARGY NATIVE NORMALIZATION)
+    # 4. СЛОВАРЬ (YARGY NATIVE NORMALIZATION)
     for match in DICT_PARSER.findall(text):
         original_text = text[match.span.start:match.span.stop]
-        # match.fact.text содержит нормализованную фразу благодаря .interpretation(DictEntity.text.normalized())
         normalized_text = match.fact.text.lower() if hasattr(match.fact, 'text') else str(match.fact).lower()
         category = phrase_to_category.get(normalized_text, 'SUBJECT')
 
@@ -123,51 +128,115 @@ def extract_entities(text: str) -> List[Entity]:
             normal_form=normalized_text
         )
 
-    # ГАРАНТИРОВАННАЯ ДЕДУПЛИКАЦИЯ (более длинные совпадения побеждают)
-    unique_entities = {}
-    for e in sorted(entities, key=lambda x: (x.end_pos - x.start_pos), reverse=True):
-        unique_entities[(e.start_pos, e.end_pos)] = e
+    # УМНАЯ ДЕДУПЛИКАЦИЯ: удаляем вложенные сущности, оставляем самые длинные
+    unique_entities = []
+    sorted_entities = sorted(entities, key=lambda x: (x.start_pos, -(x.end_pos - x.start_pos)))
 
-    return list(unique_entities.values())
+    for e in sorted_entities:
+        is_overlapping = False
+        for existing in unique_entities:
+            if (existing.start_pos <= e.start_pos < existing.end_pos) or \
+               (existing.start_pos < e.end_pos <= existing.end_pos):
+                is_overlapping = True
+                break
 
-def link_act_money_pairs(entities: List[Entity], text: str) -> List[Dict]:
+        if not is_overlapping:
+            unique_entities.append(e)
+
+    return unique_entities
+
+
+def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
+    """
+    Алгоритм "Окна контекста" для связывания SUBJECT и MONEY.
+    Работает с любым порядком: S->M, M->S, смешанные последовательности.
+    Устойчив к пропускам (если MONEY не найден - SUBJECT идет с money=null).
+    """
     pairs = []
-    sentences = text.replace('\n', ' ').split('.')
-    act_entities = [e for e in entities if e.type in ['ACT', 'NOT_ACT']]
+
+    # 1. Фильтруем сущности: берем только SUBJECT и MONEY
+    subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
 
-    for act in act_entities:
-        for money in money_entities:
-            act_idx = money_idx = None
-            current_pos = 0
-            for idx, sentence in enumerate(sentences):
-                start, end = current_pos, current_pos + len(sentence)
-                if start <= act.start_pos < end: act_idx = idx
-                if start <= money.start_pos < end: money_idx = idx
-                current_pos = end + 1
+    # 2. Сортируем по позиции в тексте
+    subjects.sort(key=lambda x: x.start_pos)
+    money_entities.sort(key=lambda x: x.start_pos)
 
-            if (act_idx == money_idx and money.start_pos > act.start_pos and (money.start_pos - act.end_pos) < 150):
-                pairs.append({
-                    'act': act.model_dump(),
-                    'money': money.model_dump(),
-                    'distance': money.start_pos - act.end_pos,
-                    'context': text[act.start_pos:min(money.end_pos + 40, len(text))]
-                })
-                break
+    # 3. Отслеживаем использованные MONEY
+    used_money_indices = set()
+
+    # 4. Для каждого SUBJECT ищем ближайший MONEY в окне ±150 символов
+    WINDOW_SIZE = 150  # Радиус поиска в символах
+
+    for subject in subjects:
+        best_money = None
+        best_distance = None
+        best_money_idx = None
+
+        # Ищем в окне вокруг SUBJECT
+        for idx, money in enumerate(money_entities):
+            # Пропускаем уже использованные MONEY
+            if idx in used_money_indices:
+                continue
+
+            # Вычисляем расстояние между SUBJECT и MONEY
+            # Расстояние = от конца SUBJECT до начала MONEY (может быть отрицательным, если MONEY до SUBJECT)
+            distance = money.start_pos - subject.end_pos
+
+            # Проверяем, что MONEY попадает в окно ±150 символов
+            if abs(distance) <= WINDOW_SIZE:
+                # Выбираем ближайший MONEY (по абсолютному расстоянию)
+                if best_money is None or abs(distance) < abs(best_distance):
+                    best_money = money
+                    best_distance = distance
+                    best_money_idx = idx
+
+        # 5. Создаем пару
+        if best_money is not None:
+            # Помечаем MONEY как использованный
+            used_money_indices.add(best_money_idx)
+
+            # Формируем контекст: от начала SUBJECT до конца MONEY + 40 символов
+            context_start = subject.start_pos
+            context_end = min(best_money.end_pos + 40, len(text))
+            context = text[context_start:context_end]
+
+            pairs.append(SubjectMoneyPair(
+                subject=subject,
+                money=best_money,
+                distance=abs(best_distance),
+                context=context
+            ))
+        else:
+            # MONEY не найден - SUBJECT идет с null
+            pairs.append(SubjectMoneyPair(
+                subject=subject,
+                money=None,
+                distance=None,
+                context=None
+            ))
+
     return pairs
+
 
 # ==========================================
 # 4. API ENDPOINTS
 # ==========================================
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "ner-service", "dict_loaded_total": len(dictionary)}
+    return {
+        "status": "ok",
+        "service": "ner-service",
+        "dict_loaded_total": len(dictionary),
+        "phrases_in_pipeline": all_phrases
+    }
 
 @app.post("/extract", response_model=NERResponse)
 def extract(request: NERRequest):
     try:
         entities = extract_entities(request.text)
-        return NERResponse(entities=entities, act_money_pairs=link_act_money_pairs(entities, request.text))
+        subject_money_pairs = link_subject_money_pairs(entities, request.text)
+        return NERResponse(entities=entities, subject_money_pairs=subject_money_pairs)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
