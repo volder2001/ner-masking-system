@@ -12,7 +12,7 @@ import pymorphy3
 from natasha import MorphVocab, MoneyExtractor, DatesExtractor
 from yargy import Parser, rule, or_
 from yargy.pipelines import morph_pipeline
-from yargy.predicates import gram, capitalized, eq
+from yargy.predicates import gram  # <-- Убрали capitalized и eq, оставили только gram
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
@@ -24,20 +24,15 @@ money_extractor = MoneyExtractor(morph_vocab)
 date_extractor = DatesExtractor(morph_vocab)
 morph = pymorphy3.MorphAnalyzer()
 
-# --- СТРОГИЙ ПАРСЕР ИМЕН (чтобы не было "по", "января", "и") ---
-SURN = gram('Surn')
-NAME = gram('Name')
-PATR = gram('Patr')
-
+# --- СТРОГИЙ ПАРСЕР ИМЕН (только проверенные теги yargy) ---
 # Паттерн 1: Фамилия Имя Отчество (Иванов Иван Иванович)
-RULE_FIO = rule(SURN, NAME, PATR)
+RULE_FIO = rule(gram('Surn'), gram('Name'), gram('Patr'))
 
-# Паттерн 2: Фамилия И. О. (Иванов И. И.)
-INIT = rule(capitalized, eq('.'))
-RULE_FIO_INIT = rule(SURN, INIT, INIT)
+# Паттерн 2: Фамилия И. О. (Иванов И. И.) - используем тег Abbr (сокращение)
+RULE_FIO_INIT = rule(gram('Surn'), gram('Abbr'), gram('Abbr'))
 
 # Паттерн 3: Имя Отчество Фамилия (Иван Иванович Иванов)
-RULE_IOF = rule(NAME, PATR, SURN)
+RULE_IOF = rule(gram('Name'), gram('Patr'), gram('Surn'))
 
 # Объединяем правила
 NAME_PARSER = Parser(or_(RULE_FIO, RULE_FIO_INIT, RULE_IOF))
@@ -53,7 +48,7 @@ def load_dictionary():
 
 dictionary = load_dictionary()
 
-# Yargy morph_pipeline АВТОМАТИЧЕСКИ склоняет и словосочетания (например, "кадастровый номер")
+# Yargy morph_pipeline АВТОМАТИЧЕСКИ склоняет и словосочетания
 def build_pipeline(words):
     return Parser(morph_pipeline(words))
 
@@ -68,7 +63,7 @@ class Entity(BaseModel):
     text: str
     normal_form: str
     type: str
-    currency: Optional[str] = None  # <-- НОВОЕ ПОЛЕ для валюты
+    currency: Optional[str] = None  # Поле для валюты
     start_pos: int
     end_pos: int
     confidence: float = 1.0
@@ -87,7 +82,7 @@ def extract_entities(text: str) -> List[Entity]:
     entities = []
 
     def add_entity(word: str, entity_type: str, start: int, end: int, conf: float, currency: str = None):
-        if entity_type in ['MONEY', 'DATE']:
+        if entity_type.startswith('MONEY') or entity_type == 'DATE':
             normal = word
         else:
             normal = morph.parse(word)[0].normal_form
@@ -101,6 +96,7 @@ def extract_entities(text: str) -> List[Entity]:
     for match in money_extractor(text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
             word = text[match.start:match.stop]
+            # Тип будет MONEY_RUB, MONEY_USD и т.д.
             add_entity(word, f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
 
     # 2. ДАТЫ
@@ -133,7 +129,7 @@ def link_act_money_pairs(entities: List[Entity], text: str) -> List[Dict]:
     pairs = []
     sentences = text.replace('\n', ' ').split('.')
     act_entities = [e for e in entities if e.type in ['ACT', 'NOT_ACT']]
-    money_entities = [e for e in entities if e.type.startswith('MONEY')] # Ловим MONEY_RUB, MONEY_USD и т.д.
+    money_entities = [e for e in entities if e.type.startswith('MONEY')]
 
     for act in act_entities:
         for money in money_entities:
