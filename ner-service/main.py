@@ -1,7 +1,6 @@
 """
 ner-service/main.py
-ULTIMATE: Гибридный подход + Фильтр адресов для NAME + Улучшенная нормализация фраз
-Алгоритм "Окна контекста" для связывания SUBJECT-MONEY (любой порядок, устойчив к пропускам)
+FINAL PRODUCTION: Глобальная минимальная дистанция для пар + Фильтр латиницы в именах
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -27,7 +26,6 @@ date_extractor = DatesExtractor(morph_vocab)
 names_extractor = NamesExtractor(morph_vocab)
 morph = pymorphy3.MorphAnalyzer()
 
-# Маркеры адреса для фильтрации ложных NAME
 ADDRESS_MARKERS: Set[str] = {
     'ул.', 'улица', 'пр.', 'проспект', 'д.', 'дом', 'кв.', 'квартира',
     'г.', 'город', 'пер.', 'переулок', 'бул.', 'бульвар', 'ш.', 'шоссе',
@@ -36,14 +34,12 @@ ADDRESS_MARKERS: Set[str] = {
     'мкр.', 'микрорайон', 'наб.', 'набережная', 'туп.', 'тупик'
 }
 
-# Предлоги для удаления из нормальной формы фраз
 PREPOSITIONS: Set[str] = {
     'за', 'по', 'на', 'в', 'с', 'к', 'у', 'о', 'об', 'от', 'до',
     'из', 'под', 'над', 'через', 'между', 'при', 'без', 'для', 'про',
     'а', 'и', 'но', 'или', 'же', 'бы', 'ли', 'то'
 }
 
-# Загрузка словаря
 DICT_PATH = Path("/app/data/dictionary.json")
 def load_dictionary():
     if DICT_PATH.exists():
@@ -53,7 +49,6 @@ def load_dictionary():
 
 dictionary = load_dictionary()
 
-# Yargy для словаря (с лемматизацией через .normalized())
 phrase_to_category = {}
 all_phrases = []
 for category, phrases in dictionary.items():
@@ -65,10 +60,9 @@ DictEntity = fact('DictEntity', ['text'])
 DICT_RULE = morph_pipeline(all_phrases).interpretation(DictEntity.text.normalized())
 DICT_PARSER = Parser(DICT_RULE)
 
-# Regex для надежного поиска дат (включая кавычки и "г.")
 DATE_REGEXES = [
-    re.compile(r'\b\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}\b'), # 27.09.67 или 27-09-1967
-    re.compile(r'["\']?\d{1,2}["\']?\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{2,4}\s*г\.?', re.IGNORECASE) # "27" сентября 1967г.
+    re.compile(r'\b\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}\b'),
+    re.compile(r'["\']?\d{1,2}["\']?\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{2,4}\s*г\.?', re.IGNORECASE)
 ]
 
 # ==========================================
@@ -85,9 +79,9 @@ class Entity(BaseModel):
 
 class SubjectMoneyPair(BaseModel):
     subject: Entity
-    money: Optional[Entity] = None  # Может быть null, если сумма не найдена
-    distance: Optional[int] = None  # Расстояние в символах (может быть null)
-    context: Optional[str] = None   # Контекст из текста (может быть null)
+    money: Optional[Entity] = None
+    distance: Optional[int] = None
+    context: Optional[str] = None
 
 class NERRequest(BaseModel):
     text: str
@@ -100,46 +94,22 @@ class NERResponse(BaseModel):
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 def is_address_context(text: str, start_pos: int) -> bool:
-    """
-    Умный фильтр: проверяет, стоит ли непосредственно перед словом маркер адреса.
-    Например: "ул. М. Максаковой" -> True, но "Взыскать с должника Юдиной..." -> False.
-    """
-    # Берем 15 символов перед началом совпадения (достаточно для "ул. ", "д. ", "г. ")
     context_start = max(0, start_pos - 15)
     context = text[context_start:start_pos].lower().strip()
-
-    # Проверяем, заканчивается ли контекст на маркер адреса (с пробелом или точкой)
     for marker in ADDRESS_MARKERS:
         if context.endswith(marker) or context.endswith(marker + '. ') or context.endswith(marker + ' '):
             return True
     return False
 
-
 def get_phrase_normal_form(phrase: str) -> str:
-    """
-    Получает нормальную форму фразы, пропуская предлоги и союзы,
-    но стараясь сохранить исходное написание, если лемматизация ломает согласование.
-    """
     words = phrase.split()
     normal_words = []
-
     for word in words:
         parsed = morph.parse(word)[0]
-        # Пропускаем только явные предлоги (PREP) и союзы (CONJ)
         if 'PREP' in parsed.tag.grammemes or 'CONJ' in parsed.tag.grammemes:
             continue
-
-        # Хак: если слово уже в начальной форме или это существительное, оставляем как есть
-        # чтобы избежать "горячий водоснабжение"
-        if 'NOUN' in parsed.tag.grammemes or 'ADJF' in parsed.tag.grammemes:
-            # Для прилагательных иногда лучше оставить исходное слово, если Pymorphy ошибается с родом
-            # Но для простоты оставим нормальную форму, для поиска это ок.
-            pass
-
         normal_words.append(parsed.normal_form)
-
     return ' '.join(normal_words) if normal_words else phrase
-
 
 # ==========================================
 # 4. ЛОГИКА ИЗВЛЕЧЕНИЯ
@@ -147,11 +117,9 @@ def get_phrase_normal_form(phrase: str) -> str:
 def extract_entities(text: str) -> List[Entity]:
     entities = []
 
-    def add_entity(word: str, entity_type: str, start: int, end: int, conf: float,
-                   currency: str = None, normal_form: str = None):
+    def add_entity(word: str, entity_type: str, start: int, end: int, conf: float, currency: str = None, normal_form: str = None):
         if normal_form is None:
             normal_form = word if entity_type.startswith('MONEY') or entity_type == 'DATE' else morph.parse(word)[0].normal_form
-
         entities.append(Entity(
             text=word, normal_form=normal_form, type=entity_type,
             currency=currency, start_pos=start, end_pos=end, confidence=conf
@@ -163,50 +131,40 @@ def extract_entities(text: str) -> List[Entity]:
             word = text[match.start:match.stop]
             add_entity(word, f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
 
-    # 2. ДАТЫ (Гибрид: Natasha + Regex)
+    # 2. ДАТЫ
     for match in date_extractor(text):
         word = text[match.start:match.stop]
         add_entity(word, 'DATE', match.start, match.stop, 0.95)
-
     for pattern in DATE_REGEXES:
         for match in pattern.finditer(text):
             add_entity(match.group(0), 'DATE', match.start(), match.end(), 0.95)
 
-    # 3. ИМЕНА (NamesExtractor + фильтр длины >= 2 слов + ФИЛЬТР АДРЕСА)
+    # 3. ИМЕНА (С ФИЛЬТРОМ АДРЕСА И ФИЛЬТРОМ ЛАТИНИЦЫ)
     for match in names_extractor(text):
         word = text[match.start:match.stop]
         if len(word.split()) >= 2:
-            # Проверяем, не является ли это адресом
             if not is_address_context(text, match.start):
-                add_entity(word, 'NAME', match.start, match.stop, 0.95)
+                # НОВОЕ: Отбрасываем, если есть латинские буквы (защита от OCR-мусора типа "Qe Л.И.")
+                if not any(char.isascii() and char.isalpha() for char in word):
+                    add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (YARGY NATIVE NORMALIZATION + УЛУЧШЕННАЯ НОРМАЛЬНАЯ ФОРМА)
+    # 4. СЛОВАРЬ
     for match in DICT_PARSER.findall(text):
         original_text = text[match.span.start:match.span.stop]
         normalized_text = match.fact.text.lower() if hasattr(match.fact, 'text') else str(match.fact).lower()
         category = phrase_to_category.get(normalized_text, 'SUBJECT')
-
-        # Получаем улучшенную нормальную форму (без предлогов)
         normal_form = get_phrase_normal_form(original_text)
+        add_entity(word=original_text, entity_type=category, start=match.span.start, end=match.span.stop, conf=0.9, normal_form=normal_form)
 
-        add_entity(
-            word=original_text, entity_type=category,
-            start=match.span.start, end=match.span.stop, conf=0.9,
-            normal_form=normal_form
-        )
-
-    # УМНАЯ ДЕДУПЛИКАЦИЯ: удаляем вложенные сущности, оставляем самые длинные
+    # 5. ДЕДУПЛИКАЦИЯ
     unique_entities = []
     sorted_entities = sorted(entities, key=lambda x: (x.start_pos, -(x.end_pos - x.start_pos)))
-
     for e in sorted_entities:
         is_overlapping = False
         for existing in unique_entities:
-            if (existing.start_pos <= e.start_pos < existing.end_pos) or \
-               (existing.start_pos < e.end_pos <= existing.end_pos):
+            if (existing.start_pos <= e.start_pos < existing.end_pos) or (existing.start_pos < e.end_pos <= existing.end_pos):
                 is_overlapping = True
                 break
-
         if not is_overlapping:
             unique_entities.append(e)
 
@@ -215,75 +173,66 @@ def extract_entities(text: str) -> List[Entity]:
 
 def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
     """
-    Алгоритм "Окна контекста" для связывания SUBJECT и MONEY.
-    Работает с любым порядком: S->M, M->S, смешанные последовательности.
-    Устойчив к пропускам (если MONEY не найден - SUBJECT идет с money=null).
+    Алгоритм "Глобальной минимальной дистанции".
+    Отдает приоритет самым близким парам, решая проблему перехвата денег общими фразами.
     """
-    pairs = []
-
-    # 1. Фильтруем сущности: берем только SUBJECT и MONEY
     subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
+    WINDOW_SIZE = 150
 
-    # 2. Сортируем по позиции в тексте
-    subjects.sort(key=lambda x: x.start_pos)
-    money_entities.sort(key=lambda x: x.start_pos)
+    # 1. Генерируем все возможные валидные пары в пределах окна
+    candidates = []
+    for subj in subjects:
+        for money in money_entities:
+            distance = abs(money.start_pos - subj.end_pos)
+            if distance <= WINDOW_SIZE:
+                candidates.append({
+                    'subject': subj,
+                    'money': money,
+                    'distance': distance
+                })
 
-    # 3. Отслеживаем использованные MONEY
-    used_money_indices = set()
+    # 2. Сортируем кандидатов по дистанции (от самых близких к дальним)
+    candidates.sort(key=lambda x: x['distance'])
 
-    # 4. Для каждого SUBJECT ищем ближайший MONEY в окне ±150 символов
-    WINDOW_SIZE = 150  # Радиус поиска в символах
+    # 3. Жадно выбираем лучшие непересекающиеся пары
+    used_subjects = set()
+    used_moneys = set()
+    final_pairs = []
 
-    for subject in subjects:
-        best_money = None
-        best_distance = None
-        best_money_idx = None
+    for candidate in candidates:
+        subj_id = (candidate['subject'].start_pos, candidate['subject'].end_pos)
+        money_id = (candidate['money'].start_pos, candidate['money'].end_pos)
 
-        # Ищем в окне вокруг SUBJECT
-        for idx, money in enumerate(money_entities):
-            # Пропускаем уже использованные MONEY
-            if idx in used_money_indices:
-                continue
+        if subj_id not in used_subjects and money_id not in used_moneys:
+            used_subjects.add(subj_id)
+            used_moneys.add(money_id)
 
-            # Вычисляем расстояние между SUBJECT и MONEY
-            distance = money.start_pos - subject.end_pos
-
-            # Проверяем, что MONEY попадает в окно ±150 символов
-            if abs(distance) <= WINDOW_SIZE:
-                # Выбираем ближайший MONEY (по абсолютному расстоянию)
-                if best_money is None or abs(distance) < abs(best_distance):
-                    best_money = money
-                    best_distance = distance
-                    best_money_idx = idx
-
-        # 5. Создаем пару
-        if best_money is not None:
-            # Помечаем MONEY как использованный
-            used_money_indices.add(best_money_idx)
-
-            # Формируем контекст: от начала SUBJECT до конца MONEY + 40 символов
-            context_start = subject.start_pos
-            context_end = min(best_money.end_pos + 40, len(text))
+            context_start = candidate['subject'].start_pos
+            context_end = min(candidate['money'].end_pos + 40, len(text))
             context = text[context_start:context_end]
 
-            pairs.append(SubjectMoneyPair(
-                subject=subject,
-                money=best_money,
-                distance=abs(best_distance),
+            final_pairs.append(SubjectMoneyPair(
+                subject=candidate['subject'],
+                money=candidate['money'],
+                distance=candidate['distance'],
                 context=context
             ))
-        else:
-            # MONEY не найден - SUBJECT идет с null
-            pairs.append(SubjectMoneyPair(
-                subject=subject,
+
+    # 4. Добавляем SUBJECT-ы, которые остались без пар (money = null)
+    for subj in subjects:
+        subj_id = (subj.start_pos, subj.end_pos)
+        if subj_id not in used_subjects:
+            final_pairs.append(SubjectMoneyPair(
+                subject=subj,
                 money=None,
                 distance=None,
                 context=None
             ))
 
-    return pairs
-
+    # Сортируем итоговые пары по порядку появления SUBJECT в тексте
+    final_pairs.sort(key=lambda x: x.subject.start_pos)
+    return final_pairs
 
 # ==========================================
 # 5. API ENDPOINTS
