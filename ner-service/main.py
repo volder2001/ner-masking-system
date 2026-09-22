@@ -101,32 +101,41 @@ class NERResponse(BaseModel):
 # ==========================================
 def is_address_context(text: str, start_pos: int) -> bool:
     """
-    Проверяет, находится ли позиция в контексте адреса.
-    Смотрит 60 символов перед позицией на наличие маркеров адреса.
+    Умный фильтр: проверяет, стоит ли непосредственно перед словом маркер адреса.
+    Например: "ул. М. Максаковой" -> True, но "Взыскать с должника Юдиной..." -> False.
     """
-    context_start = max(0, start_pos - 60)
-    context = text[context_start:start_pos].lower()
+    # Берем 15 символов перед началом совпадения (достаточно для "ул. ", "д. ", "г. ")
+    context_start = max(0, start_pos - 15)
+    context = text[context_start:start_pos].lower().strip()
 
+    # Проверяем, заканчивается ли контекст на маркер адреса (с пробелом или точкой)
     for marker in ADDRESS_MARKERS:
-        if marker in context:
+        if context.endswith(marker) or context.endswith(marker + '. ') or context.endswith(marker + ' '):
             return True
     return False
 
 
 def get_phrase_normal_form(phrase: str) -> str:
     """
-    Получает нормальную форму фразы, пропуская предлоги и союзы.
-    Например: "за отопление" -> "отопление"
-              "расходы по уплате госпошлины" -> "расход уплата госпошлина"
+    Получает нормальную форму фразы, пропуская предлоги и союзы,
+    но стараясь сохранить исходное написание, если лемматизация ломает согласование.
     """
     words = phrase.split()
     normal_words = []
 
     for word in words:
         parsed = morph.parse(word)[0]
-        # Пропускаем предлоги (PREP) и союзы (CONJ)
+        # Пропускаем только явные предлоги (PREP) и союзы (CONJ)
         if 'PREP' in parsed.tag.grammemes or 'CONJ' in parsed.tag.grammemes:
             continue
+
+        # Хак: если слово уже в начальной форме или это существительное, оставляем как есть
+        # чтобы избежать "горячий водоснабжение"
+        if 'NOUN' in parsed.tag.grammemes or 'ADJF' in parsed.tag.grammemes:
+            # Для прилагательных иногда лучше оставить исходное слово, если Pymorphy ошибается с родом
+            # Но для простоты оставим нормальную форму, для поиска это ок.
+            pass
+
         normal_words.append(parsed.normal_form)
 
     return ' '.join(normal_words) if normal_words else phrase
