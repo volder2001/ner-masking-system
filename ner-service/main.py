@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-Production-ready NER: Строгие имена (Yargy) + Валюта + Словарь (Yargy morph_pipeline)
+OPTIMIZED: Yargy morph_pipeline + Лемматизация фраз для маппинга в категории
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -24,30 +24,38 @@ money_extractor = MoneyExtractor(morph_vocab)
 date_extractor = DatesExtractor(morph_vocab)
 morph = pymorphy3.MorphAnalyzer()
 
-# --- СТРОГИЙ ПАРСЕР ИМЕН (Yargy) ---
+# Строгий парсер имен (ФИО, Ф.И.О., И.О.Ф.)
 RULE_FIO = rule(gram('Surn'), gram('Name'), gram('Patr'))
 RULE_FIO_INIT = rule(gram('Surn'), gram('Abbr'), gram('Abbr'))
 RULE_IOF = rule(gram('Name'), gram('Patr'), gram('Surn'))
 NAME_PARSER = Parser(or_(RULE_FIO, RULE_FIO_INIT, RULE_IOF))
 
-# Загрузка словаря
+# Загрузка словаря и построение маппинга
 DICT_PATH = Path("/app/data/dictionary.json")
-def load_dictionary():
+def load_dictionary_and_build_mapping():
     if DICT_PATH.exists():
         with open(DICT_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {"ACT": ["акт"], "SUBJECT": ["квартира"]}
+            raw_dict = json.load(f)
+    else:
+        raw_dict = {"ACT": ["акт"], "SUBJECT": ["квартира"]}
 
-dictionary = load_dictionary()
+    # Маппинг: "лемма фразы" -> "КАТЕГОРИЯ"
+    phrase_to_category = {}
+    all_phrases = []
 
-# Yargy morph_pipeline НАТУРАЛЬНО поддерживает словосочетания!
-# Он сам разобьет "кадастровый номер" и просклоняет каждое слово.
-def build_pipeline(words):
-    return Parser(morph_pipeline(words))
+    for category, phrases in raw_dict.items():
+        for phrase in phrases:
+            # Приводим фразу из словаря к нижнему регистру для надежного маппинга
+            normalized_phrase = phrase.lower().strip()
+            phrase_to_category[normalized_phrase] = category
+            all_phrases.append(normalized_phrase)
 
-act_pipeline = build_pipeline(dictionary.get("ACT", []))
-not_act_pipeline = build_pipeline(dictionary.get("NOT_ACT", []))
-subject_pipeline = build_pipeline(dictionary.get("SUBJECT", []))
+    return raw_dict, phrase_to_category, all_phrases
+
+dictionary, phrase_to_category, all_phrases = load_dictionary_and_build_mapping()
+
+# ОДИН парсер для всех выражений из словаря
+DICTIONARY_PARSER = Parser(morph_pipeline(all_phrases))
 
 # ==========================================
 # 2. МОДЕЛИ ДАННЫХ
@@ -90,31 +98,28 @@ def extract_entities(text: str) -> List[Entity]:
     for match in date_extractor(text):
         add_entity(text[match.start:match.stop], 'DATE', match.start, match.stop, 0.95)
 
-    # 3. ИМЕНА (СТРОГО ФИО / Ф.И.О. / И.О.Ф.)
+    # 3. ИМЕНА
     for match in NAME_PARSER.findall(text):
         add_entity(text[match.span.start:match.span.stop], 'NAME', match.span.start, match.span.stop, 0.95)
 
-    # 4. СЛОВАРЬ (Yargy morph_pipeline - нативная поддержка словосочетаний)
-    for match in act_pipeline.findall(text):
-        add_entity(text[match.span.start:match.span.stop], 'ACT', match.span.start, match.span.stop, 0.95)
+    # 4. СЛОВАРЬ (ОПТИМИЗИРОВАННЫЙ ПОДХОД)
+    for match in DICTIONARY_PARSER.findall(text):
+        matched_text = text[match.span.start:match.span.stop]
 
-    for match in not_act_pipeline.findall(text):
-        add_entity(text[match.span.start:match.span.stop], 'NOT_ACT', match.span.start, match.span.stop, 0.95)
+        # Лемматизируем каждое слово в найденной фразе и склеиваем обратно
+        lemmas = [morph.parse(w)[0].normal_form.lower() for w in matched_text.split()]
+        lemma_phrase = " ".join(lemmas)
 
-    for match in subject_pipeline.findall(text):
-        add_entity(text[match.span.start:match.span.stop], 'SUBJECT', match.span.start, match.span.stop, 0.85)
+        # Ищем в маппинге
+        if lemma_phrase in phrase_to_category:
+            category = phrase_to_category[lemma_phrase]
+            add_entity(matched_text, category, match.span.start, match.span.stop, 0.90)
 
-    # Дедупликация: более длинные совпадения (биграммы) имеют приоритет над короткими
+    # ГАРАНТИРОВАННАЯ ДЕДУПЛИКАЦИЯ: оставляем только уникальные (start, end)
+    # Сортируем по длине (desc), чтобы длинные фразы ("кадастровый номер") побеждали короткие
     unique_entities = {}
     for e in sorted(entities, key=lambda x: (x.end_pos - x.start_pos), reverse=True):
-        covered = False
-        for start in range(e.start_pos, e.end_pos):
-            if start in unique_entities:
-                covered = True
-                break
-        if not covered:
-            for start in range(e.start_pos, e.end_pos):
-                unique_entities[start] = e
+        unique_entities[(e.start_pos, e.end_pos)] = e
 
     return list(unique_entities.values())
 
@@ -134,8 +139,7 @@ def link_act_money_pairs(entities: List[Entity], text: str) -> List[Dict]:
                 if start <= money.start_pos < end: money_idx = idx
                 current_pos = end + 1
 
-            if (act_idx == money_idx and money.start_pos > act.start_pos and
-                (money.start_pos - act.end_pos) < 150):
+            if (act_idx == money_idx and money.start_pos > act.start_pos and (money.start_pos - act.end_pos) < 150):
                 pairs.append({
                     'act': act.model_dump(),
                     'money': money.model_dump(),
@@ -150,7 +154,12 @@ def link_act_money_pairs(entities: List[Entity], text: str) -> List[Dict]:
 # ==========================================
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "ner-service", "dict_loaded": len(dictionary)}
+    return {
+        "status": "ok",
+        "service": "ner-service",
+        "dict_loaded_total": len(dictionary),
+        "phrases_in_pipeline": all_phrases
+    }
 
 @app.post("/extract", response_model=NERResponse)
 def extract(request: NERRequest):
