@@ -76,31 +76,41 @@ def extract_with_natasha(text: str) -> List[Entity]:
 # ==========================================
 def extract_with_yargy(text: str, dictionary: dict) -> List[Entity]:
     entities = []
+    # Приводим текст к нижнему регистру для поиска, но позиции символов останутся теми же
+    text_lower = text.lower()
+
     for entity_type, variants in dictionary.items():
-        # Создаем правило БЕЗ .label()
         rule_pattern = or_(*[eq(variant.lower()) for variant in variants])
         parser = Parser(rule_pattern)
-        for match in parser.finditer(text.lower()):
+
+        # ИСПОЛЬЗУЕМ findall ВМЕСТО finditer
+        for match in parser.findall(text_lower):
+            start = match.span.start
+            stop = match.span.stop
             entities.append(Entity(
-                text=match.text,
-                type=entity_type,  # <-- Присваиваем тип вручную здесь
-                start_pos=match.start,
-                end_pos=match.start + len(match.text),
+                text=text[start:stop],  # Берем текст из оригинала, чтобы сохранить регистр
+                type=entity_type,
+                start_pos=start,
+                end_pos=stop,
                 confidence=0.95
             ))
     return entities
 
+
 def extract_subjects_morph(text: str) -> List[Entity]:
     subjects = ['квартира', 'автомобиль', 'машина', 'дом', 'земля', 'участок', 'гараж', 'дача', 'офис']
-    # Создаем пайплайн БЕЗ .label()
     parser = Parser(morph_pipeline(subjects))
     entities = []
-    for match in parser.finditer(text):
+
+    # ИСПОЛЬЗУЕМ findall ВМЕСТО finditer
+    for match in parser.findall(text):
+        start = match.span.start
+        stop = match.span.stop
         entities.append(Entity(
-            text=match.text,
-            type='SUBJECT',      # <-- Присваиваем тип вручную здесь
-            start_pos=match.start,
-            end_pos=match.start + len(match.text),
+            text=text[start:stop],
+            type='SUBJECT',
+            start_pos=start,
+            end_pos=stop,
             confidence=0.85
         ))
     return entities
