@@ -105,10 +105,15 @@ def extract_entities(text: str) -> List[Entity]:
         add_entity(text[match.span.start:match.span.stop], 'NAME', match.span.start, match.span.stop, 0.95)
 
     # 4. СЛОВАРЬ (YARGY NATIVE NORMALIZATION + MAPPING)
+    # 4. СЛОВАРЬ (YARGY NATIVE NORMALIZATION + MAPPING)
     for match in DICT_PARSER.findall(text):
         original_text = text[match.span.start:match.span.stop]
-        # match.fact.text УЖЕ содержит идеальную нормальную форму благодаря .normalized()!
-        normalized_text = match.fact.text.lower()
+
+        # Универсальный способ получить нормализованный текст (работает и для str, и для объекта)
+        if hasattr(match.fact, 'text'):
+            normalized_text = match.fact.text.lower()
+        else:
+            normalized_text = str(match.fact).lower()
 
         # Берем категорию из нашего маппинга
         category = phrase_to_category.get(normalized_text, 'SUBJECT')
@@ -119,7 +124,7 @@ def extract_entities(text: str) -> List[Entity]:
             start=match.span.start,
             end=match.span.stop,
             conf=0.9,
-            normal_form=normalized_text # <-- БЕРЕМ НОРМАЛЬНУЮ ФОРМУ ПРЯМО ИЗ YARGY!
+            normal_form=normalized_text  # <-- ИДЕАЛЬНАЯ НОРМАЛЬНАЯ ФОРМА ОТ YARGY!
         )
 
     # ГАРАНТИРОВАННАЯ ДЕДУПЛИКАЦИЯ
