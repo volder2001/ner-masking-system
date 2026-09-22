@@ -1,11 +1,11 @@
 """
 ner-service/main.py
-ULTIMATE: Гибридный подход (NamesExtractor + фильтр длины, DatesExtractor + Regex для кавычек, Yargy normalized)
+ULTIMATE: Гибридный подход + Фильтр адресов для NAME + Улучшенная нормализация фраз
 Алгоритм "Окна контекста" для связывания SUBJECT-MONEY (любой порядок, устойчив к пропускам)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 import json
 import re
 from pathlib import Path
@@ -26,6 +26,22 @@ money_extractor = MoneyExtractor(morph_vocab)
 date_extractor = DatesExtractor(morph_vocab)
 names_extractor = NamesExtractor(morph_vocab)
 morph = pymorphy3.MorphAnalyzer()
+
+# Маркеры адреса для фильтрации ложных NAME
+ADDRESS_MARKERS: Set[str] = {
+    'ул.', 'улица', 'пр.', 'проспект', 'д.', 'дом', 'кв.', 'квартира',
+    'г.', 'город', 'пер.', 'переулок', 'бул.', 'бульвар', 'ш.', 'шоссе',
+    'ул', 'пр', 'д', 'кв', 'г', 'пер', 'бул', 'ш',
+    'обл.', 'область', 'р-н', 'район', 'с.', 'село', 'п.', 'поселок',
+    'мкр.', 'микрорайон', 'наб.', 'набережная', 'туп.', 'тупик'
+}
+
+# Предлоги для удаления из нормальной формы фраз
+PREPOSITIONS: Set[str] = {
+    'за', 'по', 'на', 'в', 'с', 'к', 'у', 'о', 'об', 'от', 'до',
+    'из', 'под', 'над', 'через', 'между', 'при', 'без', 'для', 'про',
+    'а', 'и', 'но', 'или', 'же', 'бы', 'ли', 'то'
+}
 
 # Загрузка словаря
 DICT_PATH = Path("/app/data/dictionary.json")
@@ -81,12 +97,49 @@ class NERResponse(BaseModel):
     subject_money_pairs: List[SubjectMoneyPair]
 
 # ==========================================
-# 3. ЛОГИКА ИЗВЛЕЧЕНИЯ
+# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==========================================
+def is_address_context(text: str, start_pos: int) -> bool:
+    """
+    Проверяет, находится ли позиция в контексте адреса.
+    Смотрит 60 символов перед позицией на наличие маркеров адреса.
+    """
+    context_start = max(0, start_pos - 60)
+    context = text[context_start:start_pos].lower()
+
+    for marker in ADDRESS_MARKERS:
+        if marker in context:
+            return True
+    return False
+
+
+def get_phrase_normal_form(phrase: str) -> str:
+    """
+    Получает нормальную форму фразы, пропуская предлоги и союзы.
+    Например: "за отопление" -> "отопление"
+              "расходы по уплате госпошлины" -> "расход уплата госпошлина"
+    """
+    words = phrase.split()
+    normal_words = []
+
+    for word in words:
+        parsed = morph.parse(word)[0]
+        # Пропускаем предлоги (PREP) и союзы (CONJ)
+        if 'PREP' in parsed.tag.grammemes or 'CONJ' in parsed.tag.grammemes:
+            continue
+        normal_words.append(parsed.normal_form)
+
+    return ' '.join(normal_words) if normal_words else phrase
+
+
+# ==========================================
+# 4. ЛОГИКА ИЗВЛЕЧЕНИЯ
 # ==========================================
 def extract_entities(text: str) -> List[Entity]:
     entities = []
 
-    def add_entity(word: str, entity_type: str, start: int, end: int, conf: float, currency: str = None, normal_form: str = None):
+    def add_entity(word: str, entity_type: str, start: int, end: int, conf: float,
+                   currency: str = None, normal_form: str = None):
         if normal_form is None:
             normal_form = word if entity_type.startswith('MONEY') or entity_type == 'DATE' else morph.parse(word)[0].normal_form
 
@@ -110,22 +163,27 @@ def extract_entities(text: str) -> List[Entity]:
         for match in pattern.finditer(text):
             add_entity(match.group(0), 'DATE', match.start(), match.end(), 0.95)
 
-    # 3. ИМЕНА (NamesExtractor + фильтр длины >= 2 слов)
+    # 3. ИМЕНА (NamesExtractor + фильтр длины >= 2 слов + ФИЛЬТР АДРЕСА)
     for match in names_extractor(text):
         word = text[match.start:match.stop]
         if len(word.split()) >= 2:
-            add_entity(word, 'NAME', match.start, match.stop, 0.95)
+            # Проверяем, не является ли это адресом
+            if not is_address_context(text, match.start):
+                add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (YARGY NATIVE NORMALIZATION)
+    # 4. СЛОВАРЬ (YARGY NATIVE NORMALIZATION + УЛУЧШЕННАЯ НОРМАЛЬНАЯ ФОРМА)
     for match in DICT_PARSER.findall(text):
         original_text = text[match.span.start:match.span.stop]
         normalized_text = match.fact.text.lower() if hasattr(match.fact, 'text') else str(match.fact).lower()
         category = phrase_to_category.get(normalized_text, 'SUBJECT')
 
+        # Получаем улучшенную нормальную форму (без предлогов)
+        normal_form = get_phrase_normal_form(original_text)
+
         add_entity(
             word=original_text, entity_type=category,
             start=match.span.start, end=match.span.stop, conf=0.9,
-            normal_form=normalized_text
+            normal_form=normal_form
         )
 
     # УМНАЯ ДЕДУПЛИКАЦИЯ: удаляем вложенные сущности, оставляем самые длинные
@@ -180,7 +238,6 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
                 continue
 
             # Вычисляем расстояние между SUBJECT и MONEY
-            # Расстояние = от конца SUBJECT до начала MONEY (может быть отрицательным, если MONEY до SUBJECT)
             distance = money.start_pos - subject.end_pos
 
             # Проверяем, что MONEY попадает в окно ±150 символов
@@ -220,7 +277,7 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
 
 
 # ==========================================
-# 4. API ENDPOINTS
+# 5. API ENDPOINTS
 # ==========================================
 @app.get("/")
 def read_root():
