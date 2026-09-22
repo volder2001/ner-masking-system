@@ -1,29 +1,48 @@
 """
 ner-service/main.py
-Production-ready NER-сервис с лемматизацией (Natasha + Yargy + Pymorphy3)
+Production-ready NER-сервис с лемматизацией (Natasha NER + Yargy + Pymorphy3)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict
 import pymorphy3
 
-# Natasha экстракторы
-from natasha import DateExtractor, MoneyExtractor
+# Правильные импорты Natasha
+from natasha import (
+    Segmenter, NewsMorphTagger, NewsSyntaxParser, NewsNERTagger, NewsEmbedding, Doc
+)
 # Yargy для морфологического поиска
 from yargy import Parser
 from yargy.pipelines import morph_pipeline
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
-# Инициализируем морфологический анализатор (загружается один раз при старте)
+# Инициализируем морфологический анализатор (лемматизация)
 morph = pymorphy3.MorphAnalyzer()
+
+# Инициализируем пайплайн Natasha
+embeddings = NewsEmbedding()
+segmenter = Segmenter()
+morph_tagger = NewsMorphTagger(embeddings)
+syntax_parser = NewsSyntaxParser(embeddings)
+ner_tagger = NewsNERTagger(embeddings)
+
+# Yargy пайплайны
+act_pipeline = Parser(morph_pipeline([
+    'акт', 'акта', 'акту', 'актом', 'акте', 'акты', 'актов'
+]))
+
+subject_pipeline = Parser(morph_pipeline([
+    'квартира', 'автомобиль', 'машина', 'дом', 'земля', 'участок',
+    'гараж', 'дача', 'офис', 'помещение'
+]))
 
 # ==========================================
 # МОДЕЛИ ДАННЫХ
 # ==========================================
 class Entity(BaseModel):
     text: str
-    normal_form: str  # <-- НОВОЕ ПОЛЕ: нормальная форма слова
+    normal_form: str  # Нормальная форма слова (лемма)
     type: str         # DATE, MONEY, ACT, SUBJECT
     start_pos: int
     end_pos: int
@@ -37,56 +56,43 @@ class NERResponse(BaseModel):
     act_money_pairs: List[Dict]
 
 # ==========================================
-# ИНИЦИАЛИЗАЦИЯ ЭКСТРАКТОРОВ
-# ==========================================
-date_extractor = DateExtractor()
-money_extractor = MoneyExtractor()
-
-act_pipeline = Parser(morph_pipeline([
-    'акт', 'акта', 'акту', 'актом', 'акте', 'акты', 'актов'
-]))
-
-subject_pipeline = Parser(morph_pipeline([
-    'квартира', 'автомобиль', 'машина', 'дом', 'земля', 'участок',
-    'гараж', 'дача', 'офис', 'помещение'
-]))
-
-# ==========================================
 # ЛОГИКА ИЗВЛЕЧЕНИЯ
 # ==========================================
 def extract_entities(text: str) -> List[Entity]:
     entities = []
 
-    # Вспомогательная функция для создания сущности с лемматизацией
-    def add_entity(word: str, entity_type: str, start: int, end: int, conf: float):
-        # Получаем нормальную форму (лемму)
-        normal = morph.parse(word)[0].normal_form
-        entities.append(Entity(
-            text=word,
-            normal_form=normal,
-            type=entity_type,
-            start_pos=start,
-            end_pos=end,
-            confidence=conf
-        ))
+    # 1. Natasha NER (находит DATE и MONEY)
+    doc = Doc(text)
+    doc.segment(segmenter)
+    doc.tag_morph(morph_tagger)
+    doc.parse_syntax(syntax_parser)
+    doc.tag_ner(ner_tagger)
 
-    # 1. Даты (Natasha)
-    for match in date_extractor(text):
-        add_entity(match.text, 'DATE', match.start, match.stop, 0.95)
+    for span in doc.spans:
+        if span.type in ['DATE', 'MONEY']:
+            word = span.text
+            normal = morph.parse(word)[0].normal_form
+            entities.append(Entity(
+                text=word, normal_form=normal, type=span.type,
+                start_pos=span.start, end_pos=span.stop, confidence=0.95
+            ))
 
-    # 2. Деньги (Natasha)
-    for match in money_extractor(text):
-        add_entity(match.text, 'MONEY', match.start, match.stop, 0.95)
-
-    # 3. Акты (Yargy)
+    # 2. Yargy (находит ACT и SUBJECT)
     for match in act_pipeline.findall(text):
         word = text[match.span.start:match.span.stop]
-        add_entity(word, 'ACT', match.span.start, match.span.stop, 0.95)
+        normal = morph.parse(word)[0].normal_form
+        entities.append(Entity(
+            text=word, normal_form=normal, type='ACT',
+            start_pos=match.span.start, end_pos=match.span.stop, confidence=0.95
+        ))
 
-    # 4. Предметы взыскания (Yargy)
     for match in subject_pipeline.findall(text):
         word = text[match.span.start:match.span.stop]
-        add_entity(word, 'SUBJECT', match.span.start, match.span.stop, 0.85)
+        normal = morph.parse(word)[0].normal_form
+        entities.append(Entity(
+            text=word, normal_form=normal, type='SUBJECT',
+            start_pos=match.span.start, end_pos=match.span.stop, confidence=0.85
+        ))
 
     # Удаляем дубликаты по позициям
     unique_entities = {}
@@ -114,7 +120,7 @@ def link_act_money_pairs(entities: List[Entity], text: str) -> List[Dict]:
                 current_pos = end + 1
 
             if (act_idx == money_idx and money.start_pos > act.start_pos and
-                (money.start_pos - act.end_pos) < 150): # Увеличил дистанцию до 150 для надежности
+                (money.start_pos - act.end_pos) < 150):
                 pairs.append({
                     'act': act.model_dump(),
                     'money': money.model_dump(),
