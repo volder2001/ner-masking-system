@@ -10,7 +10,7 @@ from pathlib import Path
 import pymorphy3
 
 # ПРАВИЛЬНЫЕ импорты Natasha
-from natasha import MorphVocab, MoneyExtractor, DateExtractor, NamesExtractor
+from natasha import MorphVocab, MoneyExtractor, DatesExtractor, NamesExtractor
 # Yargy для поиска по словарю
 from yargy import Parser
 from yargy.pipelines import morph_pipeline
@@ -25,7 +25,7 @@ morph_vocab = MorphVocab()
 
 # 1.2. Инициализируем экстракторы с morph_vocab
 money_extractor = MoneyExtractor(morph_vocab)
-date_extractor = DateExtractor(morph_vocab)
+date_extractor = DatesExtractor(morph_vocab)
 names_extractor = NamesExtractor(morph_vocab) # Для поиска ФИО
 
 # 1.3. Pymorphy3 оставляем для лемматизации слов из нашего кастомного словаря
