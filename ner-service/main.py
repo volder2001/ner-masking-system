@@ -10,7 +10,11 @@ from pathlib import Path
 
 # NER библиотеки
 from natasha import (
-    Segmenter, NewsMorphTagger, NewsSyntaxParser, NewsNERTagger, NewsEmbeddings, Doc
+    Segmenter,
+    NewsMorphTagger,
+    NewsSyntaxParser,
+    NewsNERTagger,
+    NewsEmbedding, Doc
 )
 from yargy import Parser, or_, eq
 from yargy.pipelines import morph_pipeline
@@ -42,7 +46,7 @@ class NERResponse(BaseModel):
 # ==========================================
 # ИНИЦИАЛИЗАЦИЯ NATASHA
 # ==========================================
-embeddings = NewsEmbeddings()
+embeddings = NewsEmbedding()
 segmenter = Segmenter()
 morph_tagger = NewsMorphTagger(embeddings)
 syntax_parser = NewsSyntaxParser(embeddings)
