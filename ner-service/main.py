@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-Production-ready NER: Строгие имена (Yargy) + Валюта + Словосочетания (morph_pipeline)
+Production-ready NER: Строгие имена (Yargy) + Валюта + Словарь (Yargy morph_pipeline)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -12,7 +12,7 @@ import pymorphy3
 from natasha import MorphVocab, MoneyExtractor, DatesExtractor
 from yargy import Parser, rule, or_
 from yargy.pipelines import morph_pipeline
-from yargy.predicates import gram  # <-- Убрали capitalized и eq, оставили только gram
+from yargy.predicates import gram
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
@@ -24,21 +24,13 @@ money_extractor = MoneyExtractor(morph_vocab)
 date_extractor = DatesExtractor(morph_vocab)
 morph = pymorphy3.MorphAnalyzer()
 
-# --- СТРОГИЙ ПАРСЕР ИМЕН (только проверенные теги yargy) ---
-# Паттерн 1: Фамилия Имя Отчество (Иванов Иван Иванович)
+# --- СТРОГИЙ ПАРСЕР ИМЕН (Yargy) ---
 RULE_FIO = rule(gram('Surn'), gram('Name'), gram('Patr'))
-
-# Паттерн 2: Фамилия И. О. (Иванов И. И.) - используем тег Abbr (сокращение)
 RULE_FIO_INIT = rule(gram('Surn'), gram('Abbr'), gram('Abbr'))
-
-# Паттерн 3: Имя Отчество Фамилия (Иван Иванович Иванов)
 RULE_IOF = rule(gram('Name'), gram('Patr'), gram('Surn'))
-
-# Объединяем правила
 NAME_PARSER = Parser(or_(RULE_FIO, RULE_FIO_INIT, RULE_IOF))
-# ----------------------------------------------------------------
 
-# Загрузка словаря (поддерживает и слова, и словосочетания!)
+# Загрузка словаря
 DICT_PATH = Path("/app/data/dictionary.json")
 def load_dictionary():
     if DICT_PATH.exists():
@@ -48,7 +40,8 @@ def load_dictionary():
 
 dictionary = load_dictionary()
 
-# Yargy morph_pipeline АВТОМАТИЧЕСКИ склоняет и словосочетания
+# Yargy morph_pipeline НАТУРАЛЬНО поддерживает словосочетания!
+# Он сам разобьет "кадастровый номер" и просклоняет каждое слово.
 def build_pipeline(words):
     return Parser(morph_pipeline(words))
 
@@ -63,7 +56,7 @@ class Entity(BaseModel):
     text: str
     normal_form: str
     type: str
-    currency: Optional[str] = None  # Поле для валюты
+    currency: Optional[str] = None
     start_pos: int
     end_pos: int
     confidence: float = 1.0
@@ -82,33 +75,26 @@ def extract_entities(text: str) -> List[Entity]:
     entities = []
 
     def add_entity(word: str, entity_type: str, start: int, end: int, conf: float, currency: str = None):
-        if entity_type.startswith('MONEY') or entity_type == 'DATE':
-            normal = word
-        else:
-            normal = morph.parse(word)[0].normal_form
-
+        normal = word if entity_type.startswith('MONEY') or entity_type == 'DATE' else morph.parse(word)[0].normal_form
         entities.append(Entity(
             text=word, normal_form=normal, type=entity_type,
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
-    # 1. ДЕНЬГИ (с извлечением реальной валюты)
+    # 1. ДЕНЬГИ
     for match in money_extractor(text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
-            word = text[match.start:match.stop]
-            # Тип будет MONEY_RUB, MONEY_USD и т.д.
-            add_entity(word, f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
+            add_entity(text[match.start:match.stop], f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
 
     # 2. ДАТЫ
     for match in date_extractor(text):
         add_entity(text[match.start:match.stop], 'DATE', match.start, match.stop, 0.95)
 
-    # 3. ИМЕНА (СТРОГО по правилам ФИО / Ф.И.О. / И.О.Ф.)
+    # 3. ИМЕНА (СТРОГО ФИО / Ф.И.О. / И.О.Ф.)
     for match in NAME_PARSER.findall(text):
-        word = text[match.span.start:match.span.stop]
-        add_entity(word, 'NAME', match.span.start, match.span.stop, 0.95)
+        add_entity(text[match.span.start:match.span.stop], 'NAME', match.span.start, match.span.stop, 0.95)
 
-    # 4. СЛОВАРЬ (Yargy сам найдет все формы, включая словосочетания)
+    # 4. СЛОВАРЬ (Yargy morph_pipeline - нативная поддержка словосочетаний)
     for match in act_pipeline.findall(text):
         add_entity(text[match.span.start:match.span.stop], 'ACT', match.span.start, match.span.stop, 0.95)
 
@@ -118,10 +104,17 @@ def extract_entities(text: str) -> List[Entity]:
     for match in subject_pipeline.findall(text):
         add_entity(text[match.span.start:match.span.stop], 'SUBJECT', match.span.start, match.span.stop, 0.85)
 
-    # Дедупликация: Yargy (идущий последним) имеет приоритет
+    # Дедупликация: более длинные совпадения (биграммы) имеют приоритет над короткими
     unique_entities = {}
-    for e in entities:
-        unique_entities[(e.start_pos, e.end_pos)] = e
+    for e in sorted(entities, key=lambda x: (x.end_pos - x.start_pos), reverse=True):
+        covered = False
+        for start in range(e.start_pos, e.end_pos):
+            if start in unique_entities:
+                covered = True
+                break
+        if not covered:
+            for start in range(e.start_pos, e.end_pos):
+                unique_entities[start] = e
 
     return list(unique_entities.values())
 
