@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-ULTIMATE: Гибридный подход (NamesExtractor + фильтр длины, DatesExtractor + Regex для кавычек)
+ULTIMATE: Гибридный подход (NamesExtractor + фильтр длины, DatesExtractor + Regex для кавычек, Yargy normalized)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -23,7 +23,7 @@ app = FastAPI(title="NER Service", version="1.0.0")
 morph_vocab = MorphVocab()
 money_extractor = MoneyExtractor(morph_vocab)
 date_extractor = DatesExtractor(morph_vocab)
-names_extractor = NamesExtractor(morph_vocab) # Возвращаем мощный экстрактор имен
+names_extractor = NamesExtractor(morph_vocab)
 morph = pymorphy3.MorphAnalyzer()
 
 # Загрузка словаря
@@ -36,7 +36,7 @@ def load_dictionary():
 
 dictionary = load_dictionary()
 
-# Yargy для словаря (с лемматизацией)
+# Yargy для словаря (с твоей гениальной лемматизацией через .normalized())
 phrase_to_category = {}
 all_phrases = []
 for category, phrases in dictionary.items():
@@ -88,30 +88,32 @@ def extract_entities(text: str) -> List[Entity]:
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
-    # 1. ДЕНЬГИ
+    # 1. ДЕНЬГИ (ИСПРАВЛЕНО: text[match.start:match.stop] вместо match.text)
     for match in money_extractor(text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
-            add_entity(match.text, f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
+            word = text[match.start:match.stop]
+            add_entity(word, f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
 
-    # 2. ДАТЫ (Гибрид: Natasha + Regex)
-    # Сначала Natasha (ловит "двадцать седьмого сентября")
+    # 2. ДАТЫ (ИСПРАВЛЕНО: text[match.start:match.stop] вместо match.text)
     for match in date_extractor(text):
-        add_entity(match.text, 'DATE', match.start, match.stop, 0.95)
-    # Потом Regex (ловит "27.09.67" и "\"27\" сентября 1967г.")
+        word = text[match.start:match.stop]
+        add_entity(word, 'DATE', match.start, match.stop, 0.95)
+
     for pattern in DATE_REGEXES:
         for match in pattern.finditer(text):
             add_entity(match.group(0), 'DATE', match.start(), match.end(), 0.95)
 
-    # 3. ИМЕНА (NamesExtractor + УМНЫЙ ФИЛЬТР)
+    # 3. ИМЕНА (ИСПРАВЛЕНО: text[match.start:match.stop] вместо match.text)
     for match in names_extractor(text):
-        # Оставляем только имена из 2 и более слов. Это отсекает "По", "И", "Января",
-        # но оставляет "Каграмамов Борис Николаевич" и "Петросян В.С."
-        if len(match.text.split()) >= 2:
-            add_entity(match.text, 'NAME', match.start, match.stop, 0.95)
+        word = text[match.start:match.stop]
+        # Оставляем только имена из 2 и более слов. Отсекает мусор, оставляет "Каграмамов Борис Николаевич" и "Петросян В.С."
+        if len(word.split()) >= 2:
+            add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (YARGY NATIVE NORMALIZATION)
+    # 4. СЛОВАРЬ (ТВОЙ ПОДХОД: YARGY NATIVE NORMALIZATION)
     for match in DICT_PARSER.findall(text):
         original_text = text[match.span.start:match.span.stop]
+        # match.fact.text содержит нормализованную фразу благодаря .interpretation(DictEntity.text.normalized())
         normalized_text = match.fact.text.lower() if hasattr(match.fact, 'text') else str(match.fact).lower()
         category = phrase_to_category.get(normalized_text, 'SUBJECT')
 
