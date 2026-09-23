@@ -73,12 +73,12 @@ CUSTOM_PATTERNS = {
     'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
 
-# БЕЗОПАСНЫЕ fallback-правила для денег (только целевые!)
+# БЕЗОПАСНЫЕ и УСТОЙЧИВЫЕ fallback-правила для денег
 MONEY_FALLBACKS = [
-    # 1. Строгое требование валюты
-    re.compile(r'\b(\d{1,3}(?:\s?\d{3})*(?:,\d{2})?)\s+(?:руб\.|рублей|коп\.|копеек)\b', re.IGNORECASE),
-    # 2. Специфично для "пени [число]" (как в примере "пени 22023,65,")
-    re.compile(r'пени\s+(\d{1,3}(?:\s?\d{3})*(?:,\d{2})?)', re.IGNORECASE),
+    # 1. Любое число + валюта (например, "84515,59 руб." или "1665.39 рублей")
+    re.compile(r'\b(\d+(?:[.,]\d{2})?)\s+(?:руб\.|рублей|коп\.|копеек)\b', re.IGNORECASE),
+    # 2. Специфично для "пени [число]" (например, "пени 22023,65")
+    re.compile(r'пени\s+(\d+(?:[.,]\d{2})?)', re.IGNORECASE),
 ]
 
 # ==========================================
@@ -195,15 +195,12 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     # 1.1 ДЕНЬГИ (Безопасные Fallback Regex)
     for pattern in MONEY_FALLBACKS:
         for match in pattern.finditer(text):
-            # Проверяем, не перекрывается ли уже найденное Natasha
             overlap = any(e.start_pos <= match.start() < e.end_pos for e in entities if e.type.startswith('MONEY'))
             if not overlap:
-                # Для паттерна "пени [число]" добавляем слово "пени" в текст для контекста
-                full_match_text = match.group(0)
-                if not re.search(r'руб|коп', full_match_text, re.IGNORECASE):
-                    full_match_text = f"пени {match.group(1)}" # Восстанавливаем контекст
-
-                add_entity(full_match_text, 'MONEY_RUB', match.start(), match.end(), 0.90, currency='RUB')
+                full_text = match.group(0)
+                number_only = match.group(1)  # Чистое число для normal_form
+                add_entity(full_text, 'MONEY_RUB', match.start(), match.end(), 0.90, currency='RUB',
+                           normal_form=number_only)
 
     # 2. ДАТЫ
     for match in date_extractor(text):
