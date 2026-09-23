@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v13: Честная нормализация найденного текста + Строгое последовательное связывание сумм
+FINAL PRODUCTION v14: Bounded Gap без цифр (решает опечатки OCR и ложные срабатывания) + фикс шапки
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -11,8 +11,6 @@ from pathlib import Path
 import pymorphy3
 
 from natasha import MorphVocab, MoneyExtractor, DatesExtractor, NamesExtractor
-from yargy import Parser
-from yargy.pipelines import morph_pipeline
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
@@ -44,23 +42,44 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. YARGY БЕЗ .normalized() + ЧЕСТНАЯ ВАЛИДАЦИЯ
+# 2. BOUNDED GAP REGEX БЕЗ ЦИФР В РАЗРЫВЕ
 # ==========================================
-phrase_to_category = {}
-all_phrases = []
+COMPILED_DICT_REGEXES = []
 
+def build_ocr_resilient_regex(phrase: str) -> Optional[re.Pattern]:
+    words = phrase.split()
+    significant_parts = []
+    for w in words:
+        clean_w = re.sub(r'[^\w\s]', '', w)
+        if not clean_w: continue
+        p = morph.parse(clean_w)[0]
+        if 'PREP' in p.tag.grammemes or 'CONJ' in p.tag.grammemes or 'PRCL' in p.tag.grammemes:
+            continue
+        lemma = p.normal_form.lower()
+        # Хак для OCR: неустойка -> н[её]?устойка
+        lemma = re.sub(r'^н([её])', r'н[её]?', lemma)
+        significant_parts.append(lemma + r'\w*')
+
+    if not significant_parts:
+        return None
+
+    # РАЗРЫВ: до 35 символов, НО без цифр ([^\d]). Это блокирует "долга 12345 договор",
+    # но пропускает "неустойка, начисленная связи возврата кредита"
+    gap = r'[^\d]{0,35}?'
+    pattern_str = r'\b' + gap.join(significant_parts) + r'\b'
+    return re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
+
+# Компилируем и сортируем по длине фразы (desc), чтобы длинные матчились первыми
+compiled_list = []
 for category, phrases in dictionary.items():
     for phrase in phrases:
-        clean_phrase = " ".join([w.strip(".,;:-") for w in phrase.split()])
-        all_phrases.append(clean_phrase)
-        phrase_to_category[clean_phrase.lower()] = category
+        regex = build_ocr_resilient_regex(phrase)
+        if regex:
+            compiled_list.append((regex, category, phrase))
 
-# ВАЖНО: Убрали .interpretation(DictEntity.text.normalized()), чтобы yargy не галлюцинировал
-DICT_RULE = morph_pipeline(all_phrases)
-DICT_PARSER = Parser(DICT_RULE)
+COMPILED_DICT_REGEXES = sorted(compiled_list, key=lambda x: len(x[2]), reverse=True)
 
 def normalize_matched_text(matched_text: str) -> str:
-    """Честно нормализует именно тот текст, который был найден, убирая предлоги"""
     norm_words = []
     for w in matched_text.split():
         clean_w = re.sub(r'[^\w]', '', w)
@@ -125,11 +144,12 @@ def extract_case_info(text: str) -> Dict:
     if not header.strip():
         return case_info
 
-    cn_match = re.search(r'(?:Дело|производство|дело|производство)\s*№?\s*([A-Za-zА-Яа-я0-9\-/\.]+)', header, re.IGNORECASE)
+    # Номер дела (разрешаем пробелы и слэши, например "2- /2022")
+    cn_match = re.search(r'(?:Дело|производство|дело|производство)\s*№?\s*([A-Za-zА-Яа-я0-9\-/\.\s]+?)(?=\n|$)', header, re.IGNORECASE)
     if cn_match:
         case_info['case_number'] = cn_match.group(1).strip()
     else:
-        cn_match2 = re.search(r'№\s*(\d+[-/]\d+[/\d]*)', header)
+        cn_match2 = re.search(r'№\s*(\d+[-/\s\d]+)', header)
         if cn_match2:
             case_info['case_number'] = cn_match2.group(1).strip()
 
@@ -150,10 +170,12 @@ def extract_case_info(text: str) -> Dict:
     if addr_match:
         case_info['court_address'] = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
 
+    # ФИО судьи (учитываем запятые и разные форматы)
     judge_patterns = [
         r'Мировой судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
         r'Мировой судья\s+([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Яа-яA-Za-z]+)',
-        r'судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)'
+        r'судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
+        r'([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)[\s,]*рассмотрев',
     ]
     for pattern in judge_patterns:
         judge_match = re.search(pattern, header)
@@ -218,33 +240,16 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 if not any(char.isascii() and char.isalpha() for char in word):
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (YARGY БЕЗ ГАЛЛЮЦИНАЦИЙ + ЧЕСТНАЯ НОРМАЛИЗАЦИЯ)
-    for match in DICT_PARSER.findall(text):
-        matched_text = text[match.span.start:match.span.stop]
-
-        best_phrase = None
-        best_overlap = 0
-        stop_words = {'в', 'на', 'по', 'за', 'с', 'к', 'у', 'о', 'об', 'от', 'до', 'из', 'под', 'над', 'и', 'а', 'но', 'или'}
-
-        for clean_phrase, category in phrase_to_category.items():
-            matched_words = set(re.findall(r'\w+', matched_text.lower()))
-            phrase_words = set(re.findall(r'\w+', clean_phrase.lower()))
-
-            m_sig = matched_words - stop_words
-            p_sig = phrase_words - stop_words
-
-            overlap = len(m_sig & p_sig)
-
-            # Должно быть минимум 2 общих значимых слова, и длина должна быть сопоставима
-            if overlap >= 2 and len(matched_text) >= len(clean_phrase) * 0.6:
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_phrase = clean_phrase
-
-        if best_phrase:
-            category = phrase_to_category[best_phrase]
-            normal_form = normalize_matched_text(matched_text)
-            add_entity(matched_text, category, match.span.start, match.span.stop, 0.9, normal_form=normal_form)
+    # 4. СЛОВАРЬ (BOUNDED GAP БЕЗ ЦИФР В РАЗРЫВЕ)
+    for regex, category, original_phrase in COMPILED_DICT_REGEXES:
+        for match in regex.finditer(text):
+            matched_text = match.group(0).strip()
+            # Доп. проверка: длина найденного должна быть хотя бы 50% от длины фразы в словаре
+            if len(matched_text) >= len(original_phrase) * 0.5:
+                overlap = any(e.start_pos <= match.start() < e.end_pos or e.start_pos < match.end() <= e.end_pos for e in entities)
+                if not overlap:
+                    normal_form = normalize_matched_text(matched_text)
+                    add_entity(matched_text, category, match.start(), match.end(), 0.9, normal_form=normal_form)
 
     # 5. КАСТОМНЫЕ РЕКВИЗИТЫ
     for entity_type, pattern in CUSTOM_PATTERNS.items():
@@ -272,12 +277,6 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 
 
 def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
-    """
-    СТРОГОЕ ПОСЛЕДОВАТЕЛЬНОЕ СВЯЗЫВАНИЕ:
-    Первый SUBJECT берет первую доступную сумму ПОСЛЕ него.
-    Второй SUBJECT берет вторую доступную сумму ПОСЛЕ него, и так далее.
-    Это гарантирует, что суммы не "сдвигаются" и не забираются назад.
-    """
     subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
 
@@ -293,17 +292,14 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
         best_distance = 9999
         best_money_idx = -1
 
-        # Ищем сумму, которая идет ПОСЛЕ текущего SUBJECT
         for i in range(money_idx, len(money_entities)):
             money = money_entities[i]
             distance = money.start_pos - subj.end_pos
-
             if distance >= 0 and distance < best_distance:
                 best_money = money
                 best_distance = distance
                 best_money_idx = i
 
-        # Если не нашли сумму ПОСЛЕ, ищем ближайшую ДО (как фолбэк)
         if best_money is None:
             for i in range(money_idx):
                 money = money_entities[i]
@@ -314,7 +310,6 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
                     best_money_idx = i
 
         if best_money is not None and best_distance <= WINDOW_SIZE:
-            # Если взяли сумму, которая идет ПОСЛЕ, сдвигаем указатель, чтобы не использовать её снова
             if best_distance >= 0:
                 money_idx = best_money_idx + 1
 
