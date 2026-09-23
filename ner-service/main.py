@@ -77,7 +77,7 @@ CUSTOM_PATTERNS = {
 MONEY_FALLBACKS = [
     # 1. Любое число + валюта (например, "84515,59 руб." или "1665.39 рублей")
     re.compile(r'\b(\d+(?:[.,]\d{2})?)\s+(?:руб\.|рублей|коп\.|копеек)\b', re.IGNORECASE),
-    # 2. Специфично для "пени [число]" (например, "пени 22023,65")
+    # 2. Число после слова "пени" (группа 1 захватывает только число, чтобы не поглощать SUBJECT "пени")
     re.compile(r'пени\s+(\d+(?:[.,]\d{2})?)', re.IGNORECASE),
 ]
 
@@ -192,15 +192,17 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             word = text[match.start:match.stop]
             add_entity(word, f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
 
-    # 1.1 ДЕНЬГИ (Безопасные Fallback Regex)
-    for pattern in MONEY_FALLBACKS:
-        for match in pattern.finditer(text):
-            overlap = any(e.start_pos <= match.start() < e.end_pos for e in entities if e.type.startswith('MONEY'))
-            if not overlap:
-                full_text = match.group(0)
-                number_only = match.group(1)  # Чистое число для normal_form
-                add_entity(full_text, 'MONEY_RUB', match.start(), match.end(), 0.90, currency='RUB',
-                           normal_form=number_only)
+        # 1.1 ДЕНЬГИ (Безопасные Fallback Regex)
+        for pattern in MONEY_FALLBACKS:
+            for match in pattern.finditer(text):
+                # Если в паттерне есть группы (как у "пени"), берем координаты и текст только числа (группа 1)
+                start = match.start(1) if pattern.groups > 0 else match.start()
+                end = match.end(1) if pattern.groups > 0 else match.end()
+                text_match = match.group(1) if pattern.groups > 0 else match.group(0)
+
+                overlap = any(e.start_pos <= start < e.end_pos for e in entities if e.type.startswith('MONEY'))
+                if not overlap:
+                    add_entity(text_match, 'MONEY_RUB', start, end, 0.90, currency='RUB', nor
 
     # 2. ДАТЫ
     for match in date_extractor(text):
