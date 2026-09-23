@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v14: Bounded Gap без цифр (решает опечатки OCR и ложные срабатывания) + фикс шапки
+FINAL PRODUCTION v15: Yargy + Smart Length/Significant Words Filter (Решает проблему опечаток OCR и коротких слов)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -11,6 +11,9 @@ from pathlib import Path
 import pymorphy3
 
 from natasha import MorphVocab, MoneyExtractor, DatesExtractor, NamesExtractor
+from yargy import Parser
+from yargy.pipelines import morph_pipeline
+from yargy.interpretation import fact
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
@@ -42,44 +45,44 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. BOUNDED GAP REGEX БЕЗ ЦИФР В РАЗРЫВЕ
+# 2. YARGY + SMART FILTER ДЛЯ СЛОВАРЯ
 # ==========================================
-COMPILED_DICT_REGEXES = []
+phrase_to_category = {}
+all_phrases = []
 
-def build_ocr_resilient_regex(phrase: str) -> Optional[re.Pattern]:
-    words = phrase.split()
-    significant_parts = []
-    for w in words:
-        clean_w = re.sub(r'[^\w\s]', '', w)
-        if not clean_w: continue
-        p = morph.parse(clean_w)[0]
-        if 'PREP' in p.tag.grammemes or 'CONJ' in p.tag.grammemes or 'PRCL' in p.tag.grammemes:
-            continue
-        lemma = p.normal_form.lower()
-        # Хак для OCR: неустойка -> н[её]?устойка
-        lemma = re.sub(r'^н([её])', r'н[её]?', lemma)
-        significant_parts.append(lemma + r'\w*')
-
-    if not significant_parts:
-        return None
-
-    # РАЗРЫВ: до 35 символов, НО без цифр ([^\d]). Это блокирует "долга 12345 договор",
-    # но пропускает "неустойка, начисленная связи возврата кредита"
-    gap = r'[^\d]{0,35}?'
-    pattern_str = r'\b' + gap.join(significant_parts) + r'\b'
-    return re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
-
-# Компилируем и сортируем по длине фразы (desc), чтобы длинные матчились первыми
-compiled_list = []
 for category, phrases in dictionary.items():
     for phrase in phrases:
-        regex = build_ocr_resilient_regex(phrase)
-        if regex:
-            compiled_list.append((regex, category, phrase))
+        clean_phrase = " ".join([w.strip(".,;:-") for w in phrase.split()])
+        all_phrases.append(clean_phrase)
+        phrase_to_category[clean_phrase.lower()] = category
 
-COMPILED_DICT_REGEXES = sorted(compiled_list, key=lambda x: len(x[2]), reverse=True)
+# Используем yargy без .normalized(), чтобы избежать галлюцинаций
+DICT_RULE = morph_pipeline(all_phrases)
+DICT_PARSER = Parser(DICT_RULE)
+
+STOP_WORDS = {'в', 'на', 'по', 'за', 'с', 'к', 'у', 'о', 'об', 'от', 'до', 'из', 'под', 'над', 'и', 'а', 'но', 'или', 'же', 'бы', 'ли', 'то'}
+
+def is_valid_dict_match(matched_text: str, clean_phrase: str) -> bool:
+    """Проверяет, что yargy не выцепил случайное короткое слово вместо длинной фразы"""
+    # 1. Проверка длины: найденный текст должен быть не менее 60% от длины фразы в словаре
+    if len(matched_text) < len(clean_phrase) * 0.60:
+        return False
+
+    # 2. Проверка значимых слов: должно быть не менее 70% совпадений
+    matched_words = set(re.findall(r'\w+', matched_text.lower()))
+    phrase_words = set(re.findall(r'\w+', clean_phrase.lower()))
+
+    matched_sig = matched_words - STOP_WORDS
+    phrase_sig = phrase_words - STOP_WORDS
+
+    if not phrase_sig: # Если в фразе только предлоги (маловероятно, но на всякий случай)
+        return True
+
+    overlap_ratio = len(matched_sig & phrase_sig) / len(phrase_sig)
+    return overlap_ratio >= 0.70
 
 def normalize_matched_text(matched_text: str) -> str:
+    """Честно нормализует именно тот текст, который был найден, убирая предлоги"""
     norm_words = []
     for w in matched_text.split():
         clean_w = re.sub(r'[^\w]', '', w)
@@ -144,7 +147,6 @@ def extract_case_info(text: str) -> Dict:
     if not header.strip():
         return case_info
 
-    # Номер дела (разрешаем пробелы и слэши, например "2- /2022")
     cn_match = re.search(r'(?:Дело|производство|дело|производство)\s*№?\s*([A-Za-zА-Яа-я0-9\-/\.\s]+?)(?=\n|$)', header, re.IGNORECASE)
     if cn_match:
         case_info['case_number'] = cn_match.group(1).strip()
@@ -170,7 +172,6 @@ def extract_case_info(text: str) -> Dict:
     if addr_match:
         case_info['court_address'] = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
 
-    # ФИО судьи (учитываем запятые и разные форматы)
     judge_patterns = [
         r'Мировой судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
         r'Мировой судья\s+([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Яа-яA-Za-z]+)',
@@ -240,16 +241,19 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 if not any(char.isascii() and char.isalpha() for char in word):
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (BOUNDED GAP БЕЗ ЦИФР В РАЗРЫВЕ)
-    for regex, category, original_phrase in COMPILED_DICT_REGEXES:
-        for match in regex.finditer(text):
-            matched_text = match.group(0).strip()
-            # Доп. проверка: длина найденного должна быть хотя бы 50% от длины фразы в словаре
-            if len(matched_text) >= len(original_phrase) * 0.5:
-                overlap = any(e.start_pos <= match.start() < e.end_pos or e.start_pos < match.end() <= e.end_pos for e in entities)
-                if not overlap:
-                    normal_form = normalize_matched_text(matched_text)
-                    add_entity(matched_text, category, match.start(), match.end(), 0.9, normal_form=normal_form)
+    # 4. СЛОВАРЬ (YARGY + SMART FILTER)
+    # Сортируем фразы по длине (desc), чтобы длинные проверялись первыми и блокировали короткие
+    sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
+
+    for match in DICT_PARSER.findall(text):
+        matched_text = text[match.span.start:match.span.stop]
+
+        for clean_phrase in sorted_phrases:
+            if is_valid_dict_match(matched_text, clean_phrase):
+                category = phrase_to_category[clean_phrase]
+                normal_form = normalize_matched_text(matched_text)
+                add_entity(matched_text, category, match.span.start, match.span.stop, 0.9, normal_form=normal_form)
+                break # Переходим к следующему совпадению, чтобы не дублировать категории
 
     # 5. КАСТОМНЫЕ РЕКВИЗИТЫ
     for entity_type, pattern in CUSTOM_PATTERNS.items():
