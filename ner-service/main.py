@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v10: Умная морфология (предлоги опциональны, значимые слова строги)
+FINAL PRODUCTION v11: Bounded Gap Regex (значимые слова обязательны, разрыв <= 35 символов)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -42,59 +42,53 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. УМНЫЙ ГЕНЕРАТОР REGEX ДЛЯ СЛОВАРЯ
+# 2. BOUNDED GAP REGEX ДЛЯ СЛОВАРЯ
 # ==========================================
 COMPILED_DICT_REGEXES = []
 
-def build_ocr_resilient_regex(phrase: str) -> Optional[re.Pattern]:
+def build_bounded_gap_regex(phrase: str) -> Optional[re.Pattern]:
     """
-    Строит regex, где значимые слова обязательны и идут по порядку,
-    а служебные слова (предлоги, союзы) опциональны. Это решает проблему
-    выкинутых OCR слов (например, "в связи" -> "связи").
+    Строит regex, требующий наличия ВСЕХ значимых слов фразы в правильном порядке,
+    но допускающий разрыв до 35 символов между ними (покрывает пропущенные предлоги и опечатки OCR).
+    Это предотвращает совпадение отдельных слов (например, "период" не совпадет с "задолженность за период",
+    если они далеко друг от друга).
     """
     words = phrase.split()
-    parsed_words = []
+    significant_parts = []
 
     for w in words:
-        # Очищаем от пунктуации для корректного морфологического разбора
         clean_w = re.sub(r'[^\w\s]', '', w)
         if not clean_w:
             continue
         p = morph.parse(clean_w)[0]
-        parsed_words.append((clean_w, p))
 
-    if not parsed_words:
-        return None
+        # Берем только значимые части речи
+        if 'PREP' in p.tag.grammemes or 'CONJ' in p.tag.grammemes or 'PRCL' in p.tag.grammemes:
+            continue
 
-    regex_parts = []
-    for i, (clean_w, p) in enumerate(parsed_words):
         lemma = p.normal_form.lower()
-
-        # Хак для частой OCR-ошибки: неустойка -> н[её]?устойка
+        # Хак для OCR: неустойка -> н[её]?устойка
         lemma = re.sub(r'^н([её])', r'н[её]?', lemma)
 
+        # Разрешаем стандартные окончания
         lemma_regex = lemma + r'\w*'
+        significant_parts.append(lemma_regex)
 
-        is_service_word = 'PREP' in p.tag.grammemes or 'CONJ' in p.tag.grammemes or 'PRCL' in p.tag.grammemes
+    # Если значимых слов меньше 2, фраза слишком короткая/общая, пропускаем её,
+    # чтобы избежать ложных срабатываний на отдельные слова (например, "по кредиту" -> "кредит")
+    if len(significant_parts) < 2:
+        return None
 
-        if is_service_word:
-            # Служебное слово опционально
-            regex_parts.append(r'(?:\s*' + lemma_regex + r'\s+)?')
-        else:
-            if i == len(parsed_words) - 1:
-                # Последнее значимое слово без требования пробела после
-                regex_parts.append(lemma_regex)
-            else:
-                # Значимое слово с требованием пробела после
-                regex_parts.append(lemma_regex + r'\s+')
+    # Соединяем значимые слова, допуская разрыв до 35 любых символов между ними
+    gap = r'.{0,35}?'
+    pattern_str = r'\b' + gap.join(significant_parts) + r'\b'
 
-    pattern_str = r'\b' + ''.join(regex_parts) + r'\b'
-    return re.compile(pattern_str, re.IGNORECASE)
+    return re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
 
 # Компилируем все фразы из словаря
 for category, phrases in dictionary.items():
     for phrase in phrases:
-        regex = build_ocr_resilient_regex(phrase)
+        regex = build_bounded_gap_regex(phrase)
         if regex:
             COMPILED_DICT_REGEXES.append((regex, category, phrase))
 
@@ -151,7 +145,7 @@ def extract_case_info(text: str) -> Dict:
 
     case_info = {'case_number': None, 'case_date': None, 'court_name': None, 'court_address': None, 'judge_name': None}
     if not header.strip():
-        return case_info # Корректный null, если текст начинается сразу с резолюции
+        return case_info
 
     cn_match = re.search(r'(?:Дело|производство|дело|производство)\s*№?\s*([A-Za-zА-Яа-я0-9\-/\.]+)', header, re.IGNORECASE)
     if cn_match:
@@ -246,7 +240,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 if not any(char.isascii() and char.isalpha() for char in word):
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (УМНАЯ МОРФОЛОГИЯ)
+    # 4. СЛОВАРЬ (BOUNDED GAP)
     # Сортируем по длине оригинальной фразы (desc), чтобы длинные фразы блокировали короткие
     sorted_dict_regexes = sorted(COMPILED_DICT_REGEXES, key=lambda x: len(x[2]), reverse=True)
 
