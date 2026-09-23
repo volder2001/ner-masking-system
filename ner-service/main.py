@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v16: Устойчивость к OCR-мусору в деньгах (py6), фикс судьи и номера дела
+FINAL PRODUCTION v18: СТРОГОЕ разделение на шапку и резолюцию. SUBJECT/MONEY ищем ТОЛЬКО после РЕШИЛ.
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -13,7 +13,6 @@ import pymorphy3
 from natasha import MorphVocab, MoneyExtractor, DatesExtractor, NamesExtractor
 from yargy import Parser
 from yargy.pipelines import morph_pipeline
-from yargy.interpretation import fact
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
@@ -95,11 +94,14 @@ CUSTOM_PATTERNS = {
     'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
 
-# УСТОЙЧИВОСТЬ К OCR: py6, py6., руб, руб.
+# УСТОЙЧИВОСТЬ К OCR: захватывает "107324 py6.03", "1673 руб. 24" целиком
 MONEY_FALLBACKS = [
-    re.compile(r'\b(\d+(?:[.,]\d{2})?)\s*(?:py6\.?|py6|руб\.?|рублей|коп\.?|копеек)\b', re.IGNORECASE),
+    re.compile(r'\b(\d+(?:[.,]\d{2})?\s+(?:py6\.?\s*\d{2}|py6\s*\d{2}|руб\.?\s*\d{2}|рублей|коп\.?|копеек))\b', re.IGNORECASE),
     re.compile(r'пени\s+(\d+(?:[.,]\d{2})?)', re.IGNORECASE),
 ]
+
+# Фолбэк для госпошлины (на случай, если yargy споткнется о перенос строки)
+GOSPOSHLINA_REGEX = re.compile(r'расход\w*\s+по\s+оплат\w*\s+(?:государствен\w*\s+)?пошлин\w*', re.IGNORECASE | re.DOTALL)
 
 # ==========================================
 # 4. МОДЕЛИ ДАННЫХ
@@ -138,12 +140,10 @@ def extract_case_info(text: str) -> Dict:
     if not header.strip():
         return case_info
 
-    # 1. Номер дела: ищем после даты или ключевых слов
     cn_match = re.search(r'(?:Дело|производство|дело|производство)\s*№?\s*([A-Za-zА-Яа-я0-9\-/\.\s]+?)(?=\n|$)', header, re.IGNORECASE)
     if cn_match:
         case_info['case_number'] = cn_match.group(1).strip()
     else:
-        # Фолбэк: ищем цифры после даты в формате "22 марта 2022 59 12022"
         cn_match2 = re.search(r'\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\s+([0-9\-/\s]+?)(?=\n|$)', header, re.IGNORECASE)
         if cn_match2:
             case_info['case_number'] = cn_match2.group(1).strip()
@@ -152,7 +152,6 @@ def extract_case_info(text: str) -> Dict:
             if cn_match3:
                 case_info['case_number'] = cn_match3.group(1).strip()
 
-    # 2. Дата дела
     date_match = re.search(r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})', header, re.IGNORECASE)
     if date_match:
         case_info['case_date'] = date_match.group(1)
@@ -161,24 +160,21 @@ def extract_case_info(text: str) -> Dict:
         if date_match2:
             case_info['case_date'] = date_match2.group(1)
 
-    # 3. Наименование суда
     lines = header.strip().split('\n')
     court_lines = [line.strip() for line in lines[:5] if line.strip() and len(line.strip()) > 10 and not re.search(r'\d{6}', line)]
     if court_lines:
         case_info['court_name'] = ' '.join(court_lines).strip()
 
-    # 4. Адрес суда
     addr_match = re.search(r'(\d{6},\s*.*?(?:ул\.|улица|г\.|город|пр\.|проспект).*?)(?=\n\n|Именем|сайт|e-mail|@|$)', header, re.IGNORECASE | re.DOTALL)
     if addr_match:
         case_info['court_address'] = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
 
-    # 5. ФИО судьи (добавлен паттерн для полного имени перед "рассмотрев")
     judge_patterns = [
         r'Мировой судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
         r'Мировой судья\s+([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Яа-яA-Za-z]+)',
         r'судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
-        r'([А-Яа-яA-Za-z]+\s+[А-Яа-яA-Za-z]+\s+[А-Яа-яA-Za-z]+)[\s,]*рассмотрев', # Полное имя
-        r'([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)[\s,]*рассмотрев', # Инициалы
+        r'([А-Яа-яA-Za-z]+\s+[А-Яа-яA-Za-z]+\s+[А-Яа-яA-Za-z]+)[\s,]*рассмотрев',
+        r'([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)[\s,]*рассмотрев',
     ]
     for pattern in judge_patterns:
         judge_match = re.search(pattern, header)
@@ -203,6 +199,11 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     entities = []
     case_info = extract_case_info(text)
 
+    # НАХОДИМ ГРАНИЦУ РЕЗОЛЮТИВНОЙ ЧАСТИ
+    resolution_match = re.search(r'(?:РЕШИЛ:|ПОСТАНОВИЛ:|ОПРЕДЕЛИЛ:|ПРИКАЗЫВАЮ:)', text, re.IGNORECASE)
+    resolution_start = resolution_match.end() if resolution_match else 0
+    resolution_text = text[resolution_start:]
+
     def add_entity(word: str, entity_type: str, start: int, end: int, conf: float, currency: str = None, normal_form: str = None):
         if normal_form is None:
             normal_form = word if entity_type.startswith('MONEY') or entity_type == 'DATE' else morph.parse(word)[0].normal_form
@@ -211,34 +212,9 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
-    # 1. ДЕНЬГИ (Natasha)
-    for match in money_extractor(text):
-        if hasattr(match.fact, 'currency') and match.fact.currency:
-            add_entity(text[match.start:match.stop], f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
-
-    # 1.1 ДЕНЬГИ (Fallback Regex с поддержкой py6)
-    for pattern in MONEY_FALLBACKS:
-        for match in pattern.finditer(text):
-            if pattern.pattern.startswith('пени'):
-                text_match, start, end = match.group(1), match.start(1), match.end(1)
-            else:
-                text_match, start, end = match.group(0), match.start(), match.end()
-
-            # Очищаем от переносов строк внутри суммы
-            text_match = re.sub(r'\s+', ' ', text_match).strip()
-
-            overlap = any(e.start_pos <= start < e.end_pos for e in entities if e.type.startswith('MONEY'))
-            if not overlap:
-                add_entity(text_match, 'MONEY_RUB', start, end, 0.90, currency='RUB', normal_form=text_match)
-
-    # 2. ДАТЫ
-    for match in date_extractor(text):
-        add_entity(text[match.start:match.stop], 'DATE', match.start, match.stop, 0.95)
-    for pattern in [re.compile(r'\b\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}\b'), re.compile(r'["\']?\d{1,2}["\']?\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{2,4}\s*г\.?', re.IGNORECASE)]:
-        for match in pattern.finditer(text):
-            add_entity(match.group(0), 'DATE', match.start(), match.end(), 0.95)
-
-    # 3. ИМЕНА
+    # ==========================================
+    # А. ГЛОБАЛЬНЫЙ ПОИСК (Имена, Паспорта, Реквизиты, Даты) - по ВСЕМУ тексту
+    # ==========================================
     for match in names_extractor(text):
         word = text[match.start:match.stop]
         if len(word.split()) >= 2:
@@ -246,18 +222,12 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 if not any(char.isascii() and char.isalpha() for char in word):
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (YARGY + SMART FILTER)
-    sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
-    for match in DICT_PARSER.findall(text):
-        matched_text = text[match.span.start:match.span.stop]
-        for clean_phrase in sorted_phrases:
-            if is_valid_dict_match(matched_text, clean_phrase):
-                category = phrase_to_category[clean_phrase]
-                normal_form = normalize_matched_text(matched_text)
-                add_entity(matched_text, category, match.span.start, match.span.stop, 0.9, normal_form=normal_form)
-                break
+    for match in date_extractor(text):
+        add_entity(text[match.start:match.stop], 'DATE', match.start, match.stop, 0.95)
+    for pattern in [re.compile(r'\b\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}\b'), re.compile(r'["\']?\d{1,2}["\']?\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{2,4}\s*г\.?', re.IGNORECASE)]:
+        for match in pattern.finditer(text):
+            add_entity(match.group(0), 'DATE', match.start(), match.end(), 0.95)
 
-    # 5. КАСТОМНЫЕ РЕКВИЗИТЫ
     for entity_type, pattern in CUSTOM_PATTERNS.items():
         for match in pattern.finditer(text):
             if entity_type == 'PASSPORT':
@@ -267,7 +237,54 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             else:
                 add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
 
-    # 6. ДЕДУПЛИКАЦИЯ
+    # ==========================================
+    # Б. ЛОКАЛЬНЫЙ ПОИСК (SUBJECT, MONEY) - ТОЛЬКО ПОСЛЕ "РЕШИЛ:"
+    # ==========================================
+    # 1. Деньги в резолюции
+    for match in money_extractor(resolution_text):
+        if hasattr(match.fact, 'currency') and match.fact.currency:
+            add_entity(resolution_text[match.start:match.stop], f"MONEY_{match.fact.currency}",
+                       match.start + resolution_start, match.stop + resolution_start, 0.95, currency=match.fact.currency)
+
+    for pattern in MONEY_FALLBACKS:
+        for match in pattern.finditer(resolution_text):
+            if pattern.pattern.startswith('пени'):
+                text_match, start, end = match.group(1), match.start(1), match.end(1)
+            else:
+                text_match, start, end = match.group(0), match.start(), match.end()
+
+            text_match = re.sub(r'\s+', ' ', text_match).strip()
+            real_start = start + resolution_start
+            real_end = end + resolution_start
+
+            overlap = any(e.start_pos <= real_start < e.end_pos for e in entities if e.type.startswith('MONEY'))
+            if not overlap:
+                add_entity(text_match, 'MONEY_RUB', real_start, real_end, 0.90, currency='RUB', normal_form=text_match)
+
+    # 2. SUBJECT в резолюции (Yargy)
+    sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
+    for match in DICT_PARSER.findall(resolution_text):
+        matched_text = resolution_text[match.span.start:match.span.stop]
+        for clean_phrase in sorted_phrases:
+            if is_valid_dict_match(matched_text, clean_phrase):
+                category = phrase_to_category[clean_phrase]
+                normal_form = normalize_matched_text(matched_text)
+                add_entity(matched_text, category, match.span.start + resolution_start, match.span.stop + resolution_start, 0.9, normal_form=normal_form)
+                break
+
+    # 3. Фолбэк для госпошлины в резолюции (если yargy не справился из-за переноса строки)
+    for match in GOSPOSHLINA_REGEX.finditer(resolution_text):
+        matched_text = match.group(0).strip()
+        real_start = match.start() + resolution_start
+        real_end = match.end() + resolution_start
+        # Проверяем, не добавили ли мы это уже через yargy
+        overlap = any(e.start_pos <= real_start < e.end_pos or real_start < e.end_pos <= real_end for e in entities if 'пошлин' in e.text.lower())
+        if not overlap:
+            add_entity(matched_text, 'SUBJECT', real_start, real_end, 0.9, normal_form="расход оплата государственная пошлина")
+
+    # ==========================================
+    # В. ДЕДУПЛИКАЦИЯ
+    # ==========================================
     unique_entities = []
     sorted_entities = sorted(entities, key=lambda x: (x.start_pos, -(x.end_pos - x.start_pos)))
     for e in sorted_entities:
