@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION: Все реквизиты (ИНН, КПП, ОГРН, БИК, счета, паспорта, адреса) + Направленная дистанция
+FINAL PRODUCTION v2: Улучшенные Regex для паспортов, договоров и адресов
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -60,24 +60,30 @@ DATE_REGEXES = [
 ]
 
 # ==========================================
-# КАСТОМНЫЕ REGEX-ПАТТЕРНЫ ДЛЯ РЕКВИЗИТОВ
+# КАСТОМНЫЕ REGEX-ПАТТЕРНЫ (УЛУЧШЕННЫЕ)
 # ==========================================
 CUSTOM_PATTERNS = {
+    # ИНН: 10 цифр (юр. лицо) или 12 цифр (физ. лицо)
     'INN': re.compile(r'\bИНН\s*(\d{10}|\d{12})\b'),
-    'KPP': re.compile(r'\bКПП\s*(\d{9})\b'),
+    # КПП: 9 цифр (добавили КИП для устойчивости к OCR-ошибкам)
+    'KPP': re.compile(r'\b(?:КПП|КИП)\s*(\d{9})\b'),
+    # ОГРН: 13 или 15 цифр
     'OGRN': re.compile(r'\bОГРН\s*(\d{13}|\d{15})\b'),
+    # БИК: начинается с 04, всего 9 цифр
     'BIK': re.compile(r'\bБИК\s*(04\d{7})\b'),
+    # Счета: 20 цифр после р/с, расчетный счет или корр. счет
     'BANK_ACCOUNT': re.compile(r'(?:р/с|расч[её]т\.?|корр\.?\s*сч[её]т\.?)\s*(\d{20})\b'),
-    'PASSPORT': re.compile(r'\bпаспорт\s+(?:гражданина\s+РФ\s+)?(\d{4})\s*(\d{6})\b'),
-    'CONTRACT_NUMBER': re.compile(r'(?:договор|№|Ne)\s*№?\s*([A-Za-zА-Яа-я0-9\-/]+(?:\d+[A-Za-zА-Яа-я0-9\-/]*)*)\b'),
+    # Паспорт: учитывает слова "серия" и "№"
+    'PASSPORT': re.compile(r'\bпаспорт\s+(?:гражданина\s+РФ\s+)?(?:серия\s+)?(\d{4})\s*(?:№\s*)?(\d{6})\b', re.IGNORECASE),
+    # Номер договора: требует слова "договор" или "соглашение", чтобы не ловить просто "№ 123"
+    'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
 
-# Маркеры для извлечения адресов
-ADDRESS_CONTEXT_MARKERS = [
-    'адрес регистрации:', 'адрес:', 'проживающий по адресу:',
-    'место рождения:', 'юридический адрес:', 'почтовый адрес:',
-    'зарегистрированного по адресу:'
-]
+# Regex для адресов: берет всё от маркера до конца строки (\n)
+ADDRESS_REGEX = re.compile(
+    r'(?:адрес регистрации|адрес|проживающий по\s+адресу|юридический адрес|почтовый адрес)\s*:\s*([^\n]+)',
+    re.IGNORECASE
+)
 
 # ==========================================
 # 2. МОДЕЛИ ДАННЫХ
@@ -124,20 +130,6 @@ def get_phrase_normal_form(phrase: str) -> str:
             continue
         normal_words.append(parsed.normal_form)
     return ' '.join(normal_words) if normal_words else phrase
-
-def extract_address(text: str, start_pos: int) -> Optional[str]:
-    """Извлекает адрес после маркера контекста"""
-    for marker in ADDRESS_CONTEXT_MARKERS:
-        marker_pos = text.lower().find(marker.lower(), max(0, start_pos - 100))
-        if marker_pos != -1 and marker_pos < start_pos:
-            # Берем текст после маркера до следующей точки или конца строки
-            end_pos = text.find('.', start_pos)
-            if end_pos == -1:
-                end_pos = len(text)
-            address = text[start_pos:end_pos].strip()
-            if len(address) > 10:  # Минимальная длина адреса
-                return address
-    return None
 
 # ==========================================
 # 4. ЛОГИКА ИЗВЛЕЧЕНИЯ
@@ -187,7 +179,6 @@ def extract_entities(text: str) -> List[Entity]:
     for entity_type, pattern in CUSTOM_PATTERNS.items():
         for match in pattern.finditer(text):
             if entity_type == 'PASSPORT':
-                # Паспорт: серия + номер
                 full_text = f"{match.group(1)} {match.group(2)}"
                 add_entity(full_text, 'PASSPORT', match.start(), match.end(), 0.95, normal_form=full_text)
             elif entity_type == 'BANK_ACCOUNT':
@@ -195,29 +186,12 @@ def extract_entities(text: str) -> List[Entity]:
             else:
                 add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
 
-    # 6. АДРЕСА (контекстное извлечение)
-    for marker in ADDRESS_CONTEXT_MARKERS:
-        marker_lower = marker.lower()
-        start_idx = 0
-        while True:
-            marker_pos = text.lower().find(marker_lower, start_idx)
-            if marker_pos == -1:
-                break
-
-            # Начало адреса - сразу после маркера
-            address_start = marker_pos + len(marker)
-            # Конец адреса - до следующей точки или конца строки
-            address_end = text.find('.', address_start)
-            if address_end == -1:
-                address_end = len(text)
-
-            address_text = text[address_start:address_end].strip()
-
-            # Проверяем, что это действительно адрес (есть маркеры адреса)
-            if len(address_text) > 10 and any(m in address_text.lower() for m in ADDRESS_MARKERS):
-                add_entity(address_text, 'ADDRESS', address_start, address_end, 0.9, normal_form=address_text)
-
-            start_idx = address_end + 1
+    # 6. АДРЕСА (УЛУЧШЕННЫЙ REGEX: берет всю строку до переноса \n)
+    for match in ADDRESS_REGEX.finditer(text):
+        address_text = match.group(1).strip()
+        # Проверяем, что в строке действительно есть маркеры адреса, чтобы отсеять мусор
+        if any(m in address_text.lower() for m in ADDRESS_MARKERS):
+            add_entity(address_text, 'ADDRESS', match.start(1), match.end(1), 0.9, normal_form=address_text)
 
     # 7. ДЕДУПЛИКАЦИЯ
     unique_entities = []
