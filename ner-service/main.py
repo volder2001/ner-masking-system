@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v7: Исправлен генератор словаря (леммы + .*?) и ограничен поиск case_info шапкой документа
+FINAL PRODUCTION v8: Ограниченная морфологическая регулярка (безопасный \w* вместо .*?)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -42,40 +42,43 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. ГЕНЕРАТОР OCR-УСТОЙЧИВЫХ REGEX ДЛЯ СЛОВАРЯ (НА ЛЕММАХ)
+# 2. БЕЗОПАСНЫЙ ГЕНЕРАТОР REGEX ДЛЯ СЛОВАРЯ
 # ==========================================
 COMPILED_DICT_REGEXES = []
 
-def build_ocr_resilient_regex(phrase: str) -> Optional[re.Pattern]:
+def build_safe_morph_regex(phrase: str) -> Optional[re.Pattern]:
     """
-    Строит regex из лемм слов фразы, соединенных через .*?
-    Это позволяет находить фразы в любом падеже и с пропущенными словами/опечатками OCR.
+    Строит regex из лемм, разрешая любые окончания (\w*), но требуя,
+    чтобы слова шли друг за другом (\s+). Это предотвращает 'поедание' цифр.
     """
     words = phrase.split()
-    lemmas = []
+    regex_parts = []
+
     for w in words:
         p = morph.parse(w)[0]
-        # Оставляем только знаменательные части речи
-        if not ('PREP' in p.tag.grammemes or 'CONJ' in p.tag.grammemes or 'PRCL' in p.tag.grammemes):
-            lemmas.append(p.normal_form.lower())
+        # Игнорируем предлоги и союзы (они часто выпадают при OCR)
+        if 'PREP' in p.tag.grammemes or 'CONJ' in p.tag.grammemes or 'PRCL' in p.tag.grammemes:
+            continue
 
-    if not lemmas:
+        lemma = p.normal_form.lower()
+        # Хак для частой OCR-ошибки: неустойка -> н[её]?устойка (ловит "нсустойка")
+        lemma = re.sub(r'н([её])', r'н[её]?', lemma)
+
+        # Разрешаем любое словообразование/окончание после леммы
+        lemma_regex = lemma + r'\w*'
+        regex_parts.append(lemma_regex)
+
+    if not regex_parts:
         return None
 
-    pattern_parts = []
-    for lemma in lemmas:
-        # Делаем последнюю гласную опциональной для устойчивости к обрезке OCR (пошлина -> пошлин)
-        l_mod = re.sub(r'([аеёиоуыэюя])$', r'[\1]?', lemma)
-        pattern_parts.append(l_mod)
-
-    # Соединяем через .*? и обрамляем границами не-слов
-    pattern_str = r'(?:^|\W)' + r'.*?'.join(pattern_parts) + r'(?:$|\W)'
-    return re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
+    # Соединяем через \s+ (пробелы, табы, переносы строк), но НЕ через .*?
+    pattern_str = r'\b' + r'\s+'.join(regex_parts) + r'\b'
+    return re.compile(pattern_str, re.IGNORECASE)
 
 # Компилируем все фразы из словаря
 for category, phrases in dictionary.items():
     for phrase in phrases:
-        regex = build_ocr_resilient_regex(phrase)
+        regex = build_safe_morph_regex(phrase)
         if regex:
             COMPILED_DICT_REGEXES.append((regex, category, phrase))
 
@@ -127,15 +130,14 @@ class NERResponse(BaseModel):
 # 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 def extract_case_info(text: str) -> Dict:
-    """Извлекает информацию о деле ТОЛЬКО из шапки документа (до РЕШИЛ/ПОСТАНОВИЛ)"""
+    """Извлекает информацию о деле ТОЛЬКО из шапки (до РЕШИЛ/ПОСТАНОВИЛ)"""
     header_match = re.search(r'^(.*?)(?:РЕШИЛ:|ПОСТАНОВИЛ:|ОПРЕДЕЛИЛ:|ПРИКАЗЫВАЮ:)', text, re.IGNORECASE | re.DOTALL)
     header = header_match.group(1) if header_match else ""
 
     case_info = {'case_number': None, 'case_date': None, 'court_name': None, 'court_address': None, 'judge_name': None}
     if not header.strip():
-        return case_info # Если шапки нет, возвращаем пустые значения
+        return case_info # Корректный null, если текст начинается сразу с резолюции
 
-    # 1. Номер дела
     cn_match = re.search(r'(?:Дело|производство|дело|производство)\s*№?\s*([A-Za-zА-Яа-я0-9\-/\.]+)', header, re.IGNORECASE)
     if cn_match:
         case_info['case_number'] = cn_match.group(1).strip()
@@ -144,7 +146,6 @@ def extract_case_info(text: str) -> Dict:
         if cn_match2:
             case_info['case_number'] = cn_match2.group(1).strip()
 
-    # 2. Дата дела
     date_match = re.search(r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})', header, re.IGNORECASE)
     if date_match:
         case_info['case_date'] = date_match.group(1)
@@ -153,22 +154,15 @@ def extract_case_info(text: str) -> Dict:
         if date_match2:
             case_info['case_date'] = date_match2.group(1)
 
-    # 3. Наименование суда (первые строки шапки, исключаем строки с почтовыми индексами)
     lines = header.strip().split('\n')
-    court_lines = []
-    for line in lines[:5]:
-        line = line.strip()
-        if line and len(line) > 10 and not re.search(r'\d{6}', line):
-            court_lines.append(line)
+    court_lines = [line.strip() for line in lines[:5] if line.strip() and len(line.strip()) > 10 and not re.search(r'\d{6}', line)]
     if court_lines:
         case_info['court_name'] = ' '.join(court_lines).strip()
 
-    # 4. Адрес суда (ищем почтовый индекс в шапке)
     addr_match = re.search(r'(\d{6},\s*.*?(?:ул\.|улица|г\.|город|пр\.|проспект).*?)(?=\n\n|Именем|сайт|e-mail|@|$)', header, re.IGNORECASE | re.DOTALL)
     if addr_match:
         case_info['court_address'] = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
 
-    # 5. ФИО судьи
     judge_patterns = [
         r'Мировой судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
         r'Мировой судья\s+([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Яа-яA-Za-z]+)',
@@ -237,14 +231,14 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 if not any(char.isascii() and char.isalpha() for char in word):
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (OCR-УСТОЙЧИВЫЙ ПОИСК НА ЛЕММАХ)
-    # Сортируем по длине оригинальной фразы (desc), чтобы длинные уникальные фразы матчились первыми
+    # 4. СЛОВАРЬ (БЕЗОПАСНЫЙ МОРФОЛОГИЧЕСКИЙ ПОИСК)
+    # Сортируем по длине оригинальной фразы (desc), чтобы длинные фразы блокировали короткие
     sorted_dict_regexes = sorted(COMPILED_DICT_REGEXES, key=lambda x: len(x[2]), reverse=True)
 
     for regex, category, original_phrase in sorted_dict_regexes:
         for match in regex.finditer(text):
             matched_text = match.group(0).strip()
-            # Проверяем перекрытие с уже найденными сущностями
+            # Проверяем перекрытие
             overlap = any(e.start_pos <= match.start() < e.end_pos or e.start_pos < match.end() <= e.end_pos for e in entities)
             if not overlap and len(matched_text) > 2:
                 add_entity(matched_text, category, match.start(), match.end(), 0.9, normal_form=original_phrase)
