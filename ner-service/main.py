@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v3: Разделение на шапку (суд, судья, номер дела) и резолютивную часть (долги)
+FINAL PRODUCTION v4: Исправление адресов, судей, поиск по всему тексту + страховка для денег
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -60,7 +60,7 @@ DATE_REGEXES = [
 ]
 
 # ==========================================
-# КАСТОМНЫЕ REGEX-ПАТТЕРНЫ
+# КАСТОМНЫЕ REGEX-ПАТТЕРНЫ (УСИЛЕННЫЕ)
 # ==========================================
 CUSTOM_PATTERNS = {
     'INN': re.compile(r'\bИНН\s*(\d{10}|\d{12})\b'),
@@ -68,11 +68,14 @@ CUSTOM_PATTERNS = {
     'OGRN': re.compile(r'\bОГРН\s*(\d{13}|\d{15})\b'),
     'BIK': re.compile(r'\bБИК\s*(04\d{7})\b'),
     'BANK_ACCOUNT': re.compile(r'(?:р/с|расч[её]т\.?|корр\.?\s*сч[её]т\.?)\s*(\d{20})\b'),
-    'PASSPORT': re.compile(r'\bпаспорт\s+(?:гражданина\s+РФ\s+)?(?:серия\s+)?(\d{4})\s*(?:№\s*)?(\d{6})\b', re.IGNORECASE),
+    # Паспорт: более гибкий, допускает "серии", "номер", переносы строк
+    'PASSPORT': re.compile(r'\bпаспорт\s+(?:гражданина\s+РФ\s+)?(?:серии?\s+)?(\d{4})\s+(?:номер\s+)?(\d{6})\b', re.IGNORECASE | re.DOTALL),
     'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
 
-# Regex для адресов
+# Страховочный Regex для денег (ловит числа с запятой, если Natasha пропустила)
+MONEY_FALLBACK_REGEX = re.compile(r'\b(\d{1,3}(?:\s?\d{3})*(?:,\d{2})?)\s*(?:руб\.|рублей|коп\.|копеек)?\b')
+
 ADDRESS_REGEX = re.compile(
     r'(?:адрес регистрации|адрес|проживающий по\s+адресу|юридический адрес|почтовый адрес)\s*:\s*([^\n]+)',
     re.IGNORECASE
@@ -102,37 +105,13 @@ class NERRequest(BaseModel):
 class NERResponse(BaseModel):
     entities: List[Entity]
     subject_money_pairs: List[SubjectMoneyPair]
-    case_info: Optional[Dict] = None  # Новая секция для данных дела
+    case_info: Optional[Dict] = None
 
 # ==========================================
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
-def split_document(text: str) -> Tuple[str, str, int]:
-    """
-    Разделяет документ на шапку и резолютивную часть.
-    Возвращает: (header_text, resolution_text, split_position)
-    """
-    # Ищем маркеры начала резолютивной части
-    markers = [
-        r'\bРЕШИЛ\b',
-        r'\bПОСТАНОВИЛ\b',
-        r'\bОПРЕДЕЛИЛ\b',
-        r'\bПРИКАЗЫВАЮ\b',
-        r'\bРЕШЕНИЕ\b',
-    ]
-
-    combined_pattern = '|'.join(markers)
-    match = re.search(combined_pattern, text, re.IGNORECASE)
-
-    if match:
-        split_pos = match.start()
-        return text[:split_pos].strip(), text[split_pos:].strip(), split_pos
-    else:
-        # Если маркер не найден, считаем весь текст резолютивной частью
-        return "", text, 0
-
-def extract_case_info(header_text: str) -> Dict:
-    """Извлекает информацию о деле из шапки документа"""
+def extract_case_info(text: str) -> Dict:
+    """Извлекает информацию о деле из всего текста, но фокусируется на шапке"""
     case_info = {
         'case_number': None,
         'case_date': None,
@@ -141,47 +120,42 @@ def extract_case_info(header_text: str) -> Dict:
         'judge_name': None
     }
 
-    # 1. Номер дела (ищем паттерны типа "Дело 2-1968/2806/2023" или просто цифры с дефисами и слешами)
-    case_number_match = re.search(r'(?:Дело\s+|дело\s+№?\s*)?(\d+[-/]\d+[/\d]*)', header_text)
+    # 1. Номер дела
+    case_number_match = re.search(r'(?:Дело\s+|дело\s+№?\s*)?(\d+[-/]\d+[/\d]*)', text)
     if case_number_match:
         case_info['case_number'] = case_number_match.group(1)
 
-    # 2. Дата дела (ищем даты в шапке)
-    date_patterns = [
-        r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})\s+года?',
-        r'(\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4})'
-    ]
-    for pattern in date_patterns:
-        date_match = re.search(pattern, header_text, re.IGNORECASE)
-        if date_match:
-            case_info['case_date'] = date_match.group(1)
-            break
+    # 2. Дата дела
+    date_match = re.search(r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})', text, re.IGNORECASE)
+    if date_match:
+        case_info['case_date'] = date_match.group(1)
+    else:
+        date_match2 = re.search(r'(\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4})', text)
+        if date_match2:
+            case_info['case_date'] = date_match2.group(1)
 
-    # 3. Наименование суда (обычно в первых строках до адреса)
-    court_name_match = re.search(
-        r'^(.+?)(?:\d{6}|\bадрес:|\b628|\b121|\b101)',
-        header_text,
-        re.DOTALL
-    )
+    # 3. Наименование суда (первые 2-3 строки до адреса или e-mail)
+    court_name_match = re.search(r'^(.+?)(?=\d{6}|e-mail:|Именем)', text, re.DOTALL | re.IGNORECASE)
     if court_name_match:
         case_info['court_name'] = court_name_match.group(1).strip()
 
-    # 4. Адрес суда (ищем после маркеров адреса)
+    # 4. Адрес суда (ищем почтовый индекс и маркеры адреса, допускаем переносы строк)
     court_address_match = re.search(
-        r'(?:\d{6},\s*.+?(?:ул\.|улица|пр\.|проспект|д\.|дом).+?)(?=\n\n|e-mail:|$)',
-        header_text,
-        re.IGNORECASE
+        r'(\d{6},\s*.+?(?:ул\.|улица|пр\.|проспект|д\.|дом|кв\.).*?)(?=\n\w|e-mail:|$)',
+        text, re.DOTALL | re.IGNORECASE
     )
     if court_address_match:
-        case_info['court_address'] = court_address_match.group(0).strip()
+        # Очищаем от лишних переносов строк для красоты
+        case_info['court_address'] = re.sub(r'\s+', ' ', court_address_match.group(1)).strip()
 
-    # 5. ФИО судьи (ищем после слов "судья" или в конце шапки)
+    # 5. ФИО судьи (ищем после названия региона или в конце документа)
+    # Допускаем латинские H и N из-за ошибок OCR
     judge_patterns = [
-        r'судья\s+([А-Яа-яЁё]+\s+[А-Я]\.?[А-Я]\.?\s*[А-Яа-яЁё]*)',
-        r'([А-Яа-яЁё]+\s+[А-Я]\.\s*[А-Яа-яЁё]+)\s*$',  # В конце текста (подпись)
+        r'(?:Югры|области|края|республики)\s+([А-Яа-яA-Za-z]+\s+[A-Za-zА-Яа-я]\.?\s*[A-Za-zА-Яа-я]\.?)',
+        r'Мировой судья\s+([А-Яа-яA-Za-z]+\s+[A-Za-zА-Яа-я]\.?\s*[A-Za-zА-Яа-я]\.?)'
     ]
     for pattern in judge_patterns:
-        judge_match = re.search(pattern, header_text)
+        judge_match = re.search(pattern, text)
         if judge_match:
             case_info['judge_name'] = judge_match.group(1).strip()
             break
@@ -212,15 +186,8 @@ def get_phrase_normal_form(phrase: str) -> str:
 def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     entities = []
 
-    # Разделяем документ на части
-    header_text, resolution_text, split_pos = split_document(text)
-
-    # Извлекаем информацию о деле из шапки
-    case_info = extract_case_info(header_text)
-
-    # Работаем с резолютивной частью (или со всем текстом, если шапки нет)
-    working_text = resolution_text if resolution_text else text
-    text_offset = split_pos if resolution_text else 0
+    # Извлекаем информацию о деле из всего текста
+    case_info = extract_case_info(text)
 
     def add_entity(word: str, entity_type: str, start: int, end: int, conf: float, currency: str = None, normal_form: str = None):
         if normal_form is None:
@@ -230,52 +197,59 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
-    # 1. ДЕНЬГИ
-    for match in money_extractor(working_text):
+    # 1. ДЕНЬГИ (Natasha)
+    for match in money_extractor(text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
-            word = working_text[match.start:match.stop]
-            add_entity(word, f"MONEY_{match.fact.currency}", match.start + text_offset, match.stop + text_offset, 0.95, currency=match.fact.currency)
+            word = text[match.start:match.stop]
+            add_entity(word, f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
+
+    # 1.1 ДЕНЬГИ (Fallback Regex для случаев типа "22023,65")
+    for match in MONEY_FALLBACK_REGEX.finditer(text):
+        # Проверяем, не перекрывается ли уже найденное Natasha
+        overlap = any(e.start_pos <= match.start() < e.end_pos for e in entities if e.type.startswith('MONEY'))
+        if not overlap:
+            add_entity(match.group(1), 'MONEY_RUB', match.start(), match.end(), 0.90, currency='RUB')
 
     # 2. ДАТЫ
-    for match in date_extractor(working_text):
-        word = working_text[match.start:match.stop]
-        add_entity(word, 'DATE', match.start + text_offset, match.stop + text_offset, 0.95)
+    for match in date_extractor(text):
+        word = text[match.start:match.stop]
+        add_entity(word, 'DATE', match.start, match.stop, 0.95)
     for pattern in DATE_REGEXES:
-        for match in pattern.finditer(working_text):
-            add_entity(match.group(0), 'DATE', match.start() + text_offset, match.end() + text_offset, 0.95)
+        for match in pattern.finditer(text):
+            add_entity(match.group(0), 'DATE', match.start(), match.end(), 0.95)
 
     # 3. ИМЕНА
-    for match in names_extractor(working_text):
-        word = working_text[match.start:match.stop]
+    for match in names_extractor(text):
+        word = text[match.start:match.stop]
         if len(word.split()) >= 2:
-            if not is_address_context(working_text, match.start):
+            if not is_address_context(text, match.start):
                 if not any(char.isascii() and char.isalpha() for char in word):
-                    add_entity(word, 'NAME', match.start + text_offset, match.stop + text_offset, 0.95)
+                    add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
     # 4. СЛОВАРЬ
-    for match in DICT_PARSER.findall(working_text):
-        original_text = working_text[match.span.start:match.span.stop]
+    for match in DICT_PARSER.findall(text):
+        original_text = text[match.span.start:match.span.stop]
         normalized_text = match.fact.text.lower() if hasattr(match.fact, 'text') else str(match.fact).lower()
         category = phrase_to_category.get(normalized_text, 'SUBJECT')
         normal_form = get_phrase_normal_form(original_text)
-        add_entity(word=original_text, entity_type=category, start=match.span.start + text_offset, end=match.span.stop + text_offset, conf=0.9, normal_form=normal_form)
+        add_entity(word=original_text, entity_type=category, start=match.span.start, end=match.span.stop, conf=0.9, normal_form=normal_form)
 
     # 5. КАСТОМНЫЕ РЕКВИЗИТЫ
     for entity_type, pattern in CUSTOM_PATTERNS.items():
-        for match in pattern.finditer(working_text):
+        for match in pattern.finditer(text):
             if entity_type == 'PASSPORT':
                 full_text = f"{match.group(1)} {match.group(2)}"
-                add_entity(full_text, 'PASSPORT', match.start() + text_offset, match.end() + text_offset, 0.95, normal_form=full_text)
+                add_entity(full_text, 'PASSPORT', match.start(), match.end(), 0.95, normal_form=full_text)
             elif entity_type == 'BANK_ACCOUNT':
-                add_entity(match.group(1), entity_type, match.start() + text_offset, match.end() + text_offset, 0.95, normal_form=match.group(1))
+                add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
             else:
-                add_entity(match.group(1), entity_type, match.start() + text_offset, match.end() + text_offset, 0.95, normal_form=match.group(1))
+                add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
 
     # 6. АДРЕСА
-    for match in ADDRESS_REGEX.finditer(working_text):
+    for match in ADDRESS_REGEX.finditer(text):
         address_text = match.group(1).strip()
         if any(m in address_text.lower() for m in ADDRESS_MARKERS):
-            add_entity(address_text, 'ADDRESS', match.start(1) + text_offset, match.end(1) + text_offset, 0.9, normal_form=address_text)
+            add_entity(address_text, 'ADDRESS', match.start(1), match.end(1), 0.9, normal_form=address_text)
 
     # 7. ДЕДУПЛИКАЦИЯ
     unique_entities = []
@@ -295,7 +269,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
     subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
-    WINDOW_SIZE = 150
+    WINDOW_SIZE = 200  # Немного увеличили окно для сложных юридических фраз
 
     candidates = []
     for subj in subjects:
