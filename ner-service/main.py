@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v19: Фикс пробелов в сериях паспортов (40 12) и суммах (57 329)
+FINAL PRODUCTION v20: Полный фикс пробелов в паспортах/суммах, SUBJECT фолбэки с поддержкой \n, чистка judge_name
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -67,7 +67,8 @@ def is_valid_dict_match(matched_text: str, clean_phrase: str) -> bool:
     phrase_words = set(re.findall(r'\w+', clean_phrase.lower()))
     matched_sig = matched_words - STOP_WORDS
     phrase_sig = phrase_words - STOP_WORDS
-    if not phrase_sig: return True
+    if not phrase_sig:
+        return True
     overlap_ratio = len(matched_sig & phrase_sig) / len(phrase_sig)
     return overlap_ratio >= 0.70
 
@@ -82,7 +83,7 @@ def normalize_matched_text(matched_text: str) -> str:
     return " ".join(norm_words) if norm_words else matched_text
 
 # ==========================================
-# 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ (С ФИКСАМИ ПРОБЕЛОВ)
+# 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ (С ФИКСАМИ ПРОБЕЛОВ И ПЕРЕНОСОВ)
 # ==========================================
 CUSTOM_PATTERNS = {
     'INN': re.compile(r'\bИНН\s*(\d{10}|\d{12})\b'),
@@ -90,7 +91,7 @@ CUSTOM_PATTERNS = {
     'OGRN': re.compile(r'\bОГРН\s*(\d{13}|\d{15})\b'),
     'BIK': re.compile(r'\bБИК\s*(04\d{7})\b'),
     'BANK_ACCOUNT': re.compile(r'(?:р/с|расч[её]т\.?|корр\.?\s*сч[её]т\.?)\s*(\d{20})\b'),
-    # ФИКС: (\d{2}\s?\d{2}|\d{4}) ловит и "4012", и "40 12", и "40-12"
+    # ФИКС: (\d{2}\s?\d{2}|\d{4}) ловит и "4012", и "40 12"
     'PASSPORT': re.compile(r'паспорт.*?(?:серии?\s+)?(\d{2}\s?\d{2}|\d{4}).*?(?:номер\s+)?(\d{6})\b', re.IGNORECASE | re.DOTALL),
     'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
@@ -101,7 +102,12 @@ MONEY_FALLBACKS = [
     re.compile(r'пени\s+(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)', re.IGNORECASE),
 ]
 
-GOSPOSHLINA_REGEX = re.compile(r'расход\w*\s+по\s+оплат\w*\s+(?:государствен\w*\s+)?пошлин\w*', re.IGNORECASE | re.DOTALL)
+# НОВЫЕ Фолбэки для SUBJECT, устойчивые к переносам строк (\s+ вместо пробела)
+SUBJECT_FALLBACKS = [
+    (re.compile(r'задолженност\w*\s+по\s+кредит\w*\s+договор\w*', re.IGNORECASE | re.DOTALL), "задолженность кредитный договор"),
+    (re.compile(r'задолженност\w*\s+по\s+уплат\w*\s+процент\w*', re.IGNORECASE | re.DOTALL), "задолженность уплата процент"),
+    (re.compile(r'расход\w*\s+по\s+оплат\w*\s+(?:государствен\w*\s+)?пошлин\w*', re.IGNORECASE | re.DOTALL), "расход оплата государственная пошлина"),
+]
 
 # ==========================================
 # 4. МОДЕЛИ ДАННЫХ
@@ -179,7 +185,8 @@ def extract_case_info(text: str) -> Dict:
     for pattern in judge_patterns:
         judge_match = re.search(pattern, header)
         if judge_match:
-            case_info['judge_name'] = judge_match.group(1).strip()
+            # ФИКС: Заменяем переносы строк на пробелы и убираем лишние пробелы
+            case_info['judge_name'] = re.sub(r'\s+', ' ', judge_match.group(1)).strip()
             break
 
     return case_info
@@ -211,7 +218,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
-    # А. ГЛОБАЛЬНЫЙ ПОИСК
+    # А. ГЛОБАЛЬНЫЙ ПОИСК (Имена, Даты, Реквизиты)
     for match in names_extractor(text):
         word = text[match.start:match.stop]
         if len(word.split()) >= 2:
@@ -228,7 +235,6 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     for entity_type, pattern in CUSTOM_PATTERNS.items():
         for match in pattern.finditer(text):
             if entity_type == 'PASSPORT':
-                # Очищаем серию от пробелов для единообразия (40 12 -> 4012)
                 series = match.group(1).replace(' ', '').replace('-', '')
                 number = match.group(2)
                 add_entity(f"{series} {number}", 'PASSPORT', match.start(), match.end(), 0.95, normal_form=f"{series} {number}")
@@ -237,7 +243,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             else:
                 add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
 
-    # Б. ЛОКАЛЬНЫЙ ПОИСК (РЕЗОЛЮЦИЯ)
+    # Б. ЛОКАЛЬНЫЙ ПОИСК (РЕЗОЛЮЦИЯ: SUBJECT и MONEY)
     for match in money_extractor(resolution_text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
             add_entity(resolution_text[match.start:match.stop], f"MONEY_{match.fact.currency}",
@@ -258,6 +264,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             if not overlap:
                 add_entity(text_match, 'MONEY_RUB', real_start, real_end, 0.90, currency='RUB', normal_form=text_match)
 
+    # 1. SUBJECT через Yargy
     sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
     for match in DICT_PARSER.findall(resolution_text):
         matched_text = resolution_text[match.span.start:match.span.stop]
@@ -268,13 +275,17 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 add_entity(matched_text, category, match.span.start + resolution_start, match.span.stop + resolution_start, 0.9, normal_form=normal_form)
                 break
 
-    for match in GOSPOSHLINA_REGEX.finditer(resolution_text):
-        matched_text = match.group(0).strip()
-        real_start = match.start() + resolution_start
-        real_end = match.end() + resolution_start
-        overlap = any(e.start_pos <= real_start < e.end_pos or real_start < e.end_pos <= real_end for e in entities if 'пошлин' in e.text.lower())
-        if not overlap:
-            add_entity(matched_text, 'SUBJECT', real_start, real_end, 0.9, normal_form="расход оплата государственная пошлина")
+    # 2. SUBJECT через Фолбэк-регексы (устойчивые к переносам строк)
+    for pattern, normal_form in SUBJECT_FALLBACKS:
+        for match in pattern.finditer(resolution_text):
+            matched_text = match.group(0).strip()
+            clean_matched = re.sub(r'\s+', ' ', matched_text) # Убираем переносы строк для чистоты
+            real_start = match.start() + resolution_start
+            real_end = match.end() + resolution_start
+
+            overlap = any(e.start_pos <= real_start < e.end_pos or real_start < e.end_pos <= real_end for e in entities if e.type == 'SUBJECT')
+            if not overlap:
+                add_entity(clean_matched, 'SUBJECT', real_start, real_end, 0.9, normal_form=normal_form)
 
     # В. ДЕДУПЛИКАЦИЯ
     unique_entities = []
