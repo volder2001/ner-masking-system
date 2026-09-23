@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v12: Yargy morph_pipeline + Smart Length/Overlap Filter (Железобетонная стабильность)
+FINAL PRODUCTION v13: Честная нормализация найденного текста + Строгое последовательное связывание сумм
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -13,7 +13,6 @@ import pymorphy3
 from natasha import MorphVocab, MoneyExtractor, DatesExtractor, NamesExtractor
 from yargy import Parser
 from yargy.pipelines import morph_pipeline
-from yargy.interpretation import fact
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
@@ -45,41 +44,31 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. YARGY + SMART FILTER ДЛЯ СЛОВАРЯ
+# 2. YARGY БЕЗ .normalized() + ЧЕСТНАЯ ВАЛИДАЦИЯ
 # ==========================================
 phrase_to_category = {}
 all_phrases = []
 
 for category, phrases in dictionary.items():
     for phrase in phrases:
-        # Очищаем фразу от лишней пунктуации для yargy
         clean_phrase = " ".join([w.strip(".,;:-") for w in phrase.split()])
         all_phrases.append(clean_phrase)
         phrase_to_category[clean_phrase.lower()] = category
 
-DictEntity = fact('DictEntity', ['text'])
-DICT_RULE = morph_pipeline(all_phrases).interpretation(DictEntity.text.normalized())
+# ВАЖНО: Убрали .interpretation(DictEntity.text.normalized()), чтобы yargy не галлюцинировал
+DICT_RULE = morph_pipeline(all_phrases)
 DICT_PARSER = Parser(DICT_RULE)
 
-def is_valid_dict_match(matched_text: str, clean_phrase: str) -> bool:
-    """Проверяет, что yargy не выцепил случайное короткое слово"""
-    # 1. Проверка длины: найденный текст должен быть не менее 65% от длины фразы в словаре
-    if len(matched_text) < len(clean_phrase) * 0.65:
-        return False
-
-    # 2. Проверка пересечения слов: должно быть минимум 2 общих слова
-    matched_words = set(re.findall(r'\w+', matched_text.lower()))
-    phrase_words = set(re.findall(r'\w+', clean_phrase.lower()))
-
-    # Фильтруем предлоги для более точного подсчета значимых слов
-    stop_words = {'в', 'на', 'по', 'за', 'с', 'к', 'у', 'о', 'об', 'от', 'до', 'из', 'под', 'над', 'и', 'а', 'но', 'или'}
-    matched_sig = matched_words - stop_words
-    phrase_sig = phrase_words - stop_words
-
-    if len(matched_sig & phrase_sig) >= 2:
-        return True
-
-    return False
+def normalize_matched_text(matched_text: str) -> str:
+    """Честно нормализует именно тот текст, который был найден, убирая предлоги"""
+    norm_words = []
+    for w in matched_text.split():
+        clean_w = re.sub(r'[^\w]', '', w)
+        if clean_w:
+            p = morph.parse(clean_w)[0]
+            if 'PREP' not in p.tag.grammemes and 'CONJ' not in p.tag.grammemes:
+                norm_words.append(p.normal_form)
+    return " ".join(norm_words) if norm_words else matched_text
 
 # ==========================================
 # 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ
@@ -229,18 +218,33 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 if not any(char.isascii() and char.isalpha() for char in word):
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (YARGY + SMART FILTER)
+    # 4. СЛОВАРЬ (YARGY БЕЗ ГАЛЛЮЦИНАЦИЙ + ЧЕСТНАЯ НОРМАЛИЗАЦИЯ)
     for match in DICT_PARSER.findall(text):
         matched_text = text[match.span.start:match.span.stop]
 
-        # Ищем, какой фразе из словаря это соответствует
+        best_phrase = None
+        best_overlap = 0
+        stop_words = {'в', 'на', 'по', 'за', 'с', 'к', 'у', 'о', 'об', 'от', 'до', 'из', 'под', 'над', 'и', 'а', 'но', 'или'}
+
         for clean_phrase, category in phrase_to_category.items():
-            if is_valid_dict_match(matched_text, clean_phrase):
-                add_entity(
-                    matched_text, category, match.span.start, match.span.stop, 0.9,
-                    normal_form=clean_phrase # Сохраняем оригинальную фразу из словаря как нормальную форму
-                )
-                break # Переходим к следующему совпадению, чтобы не дублировать категории
+            matched_words = set(re.findall(r'\w+', matched_text.lower()))
+            phrase_words = set(re.findall(r'\w+', clean_phrase.lower()))
+
+            m_sig = matched_words - stop_words
+            p_sig = phrase_words - stop_words
+
+            overlap = len(m_sig & p_sig)
+
+            # Должно быть минимум 2 общих значимых слова, и длина должна быть сопоставима
+            if overlap >= 2 and len(matched_text) >= len(clean_phrase) * 0.6:
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_phrase = clean_phrase
+
+        if best_phrase:
+            category = phrase_to_category[best_phrase]
+            normal_form = normalize_matched_text(matched_text)
+            add_entity(matched_text, category, match.span.start, match.span.stop, 0.9, normal_form=normal_form)
 
     # 5. КАСТОМНЫЕ РЕКВИЗИТЫ
     for entity_type, pattern in CUSTOM_PATTERNS.items():
@@ -268,48 +272,64 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 
 
 def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
+    """
+    СТРОГОЕ ПОСЛЕДОВАТЕЛЬНОЕ СВЯЗЫВАНИЕ:
+    Первый SUBJECT берет первую доступную сумму ПОСЛЕ него.
+    Второй SUBJECT берет вторую доступную сумму ПОСЛЕ него, и так далее.
+    Это гарантирует, что суммы не "сдвигаются" и не забираются назад.
+    """
     subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
-    WINDOW_SIZE = 250
 
-    candidates = []
-    for subj in subjects:
-        for money in money_entities:
-            distance = money.start_pos - subj.end_pos
-            if distance < 0:
-                distance = 9999
-            if distance <= WINDOW_SIZE:
-                candidates.append({'subject': subj, 'money': money, 'distance': distance})
+    subjects.sort(key=lambda x: x.start_pos)
+    money_entities.sort(key=lambda x: x.start_pos)
 
-    candidates.sort(key=lambda x: x['distance'])
-
-    used_subjects = set()
-    used_moneys = set()
     final_pairs = []
+    money_idx = 0
+    WINDOW_SIZE = 300
 
-    for candidate in candidates:
-        subj_id = (candidate['subject'].start_pos, candidate['subject'].end_pos)
-        money_id = (candidate['money'].start_pos, candidate['money'].end_pos)
+    for subj in subjects:
+        best_money = None
+        best_distance = 9999
+        best_money_idx = -1
 
-        if subj_id not in used_subjects and money_id not in used_moneys:
-            used_subjects.add(subj_id)
-            used_moneys.add(money_id)
-            context_start = candidate['subject'].start_pos
-            context_end = min(candidate['money'].end_pos + 40, len(text))
+        # Ищем сумму, которая идет ПОСЛЕ текущего SUBJECT
+        for i in range(money_idx, len(money_entities)):
+            money = money_entities[i]
+            distance = money.start_pos - subj.end_pos
+
+            if distance >= 0 and distance < best_distance:
+                best_money = money
+                best_distance = distance
+                best_money_idx = i
+
+        # Если не нашли сумму ПОСЛЕ, ищем ближайшую ДО (как фолбэк)
+        if best_money is None:
+            for i in range(money_idx):
+                money = money_entities[i]
+                distance = subj.start_pos - money.end_pos
+                if distance >= 0 and distance < best_distance:
+                    best_money = money
+                    best_distance = distance
+                    best_money_idx = i
+
+        if best_money is not None and best_distance <= WINDOW_SIZE:
+            # Если взяли сумму, которая идет ПОСЛЕ, сдвигаем указатель, чтобы не использовать её снова
+            if best_distance >= 0:
+                money_idx = best_money_idx + 1
+
+            context_start = subj.start_pos
+            context_end = min(best_money.end_pos + 40, len(text))
 
             final_pairs.append(SubjectMoneyPair(
-                subject=candidate['subject'],
-                money=candidate['money'],
-                distance=candidate['distance'],
+                subject=subj,
+                money=best_money,
+                distance=best_distance,
                 context=text[context_start:context_end]
             ))
-
-    for subj in subjects:
-        subj_id = (subj.start_pos, subj.end_pos)
-        if subj_id not in used_subjects:
+        else:
             final_pairs.append(SubjectMoneyPair(subject=subj, money=None, distance=None, context=None))
 
-    final_pairs.sort(key=lambda x: x.subject.start_pos)
     return final_pairs
 
 # ==========================================
