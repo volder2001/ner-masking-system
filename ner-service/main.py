@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v18: СТРОГОЕ разделение на шапку и резолюцию. SUBJECT/MONEY ищем ТОЛЬКО после РЕШИЛ.
+FINAL PRODUCTION v19: Фикс пробелов в сериях паспортов (40 12) и суммах (57 329)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -82,7 +82,7 @@ def normalize_matched_text(matched_text: str) -> str:
     return " ".join(norm_words) if norm_words else matched_text
 
 # ==========================================
-# 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ
+# 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ (С ФИКСАМИ ПРОБЕЛОВ)
 # ==========================================
 CUSTOM_PATTERNS = {
     'INN': re.compile(r'\bИНН\s*(\d{10}|\d{12})\b'),
@@ -90,17 +90,17 @@ CUSTOM_PATTERNS = {
     'OGRN': re.compile(r'\bОГРН\s*(\d{13}|\d{15})\b'),
     'BIK': re.compile(r'\bБИК\s*(04\d{7})\b'),
     'BANK_ACCOUNT': re.compile(r'(?:р/с|расч[её]т\.?|корр\.?\s*сч[её]т\.?)\s*(\d{20})\b'),
-    'PASSPORT': re.compile(r'паспорт.*?(?:серии?\s+)?(\d{4}).*?(?:номер\s+)?(\d{6})\b', re.IGNORECASE | re.DOTALL),
+    # ФИКС: (\d{2}\s?\d{2}|\d{4}) ловит и "4012", и "40 12", и "40-12"
+    'PASSPORT': re.compile(r'паспорт.*?(?:серии?\s+)?(\d{2}\s?\d{2}|\d{4}).*?(?:номер\s+)?(\d{6})\b', re.IGNORECASE | re.DOTALL),
     'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
 
-# УСТОЙЧИВОСТЬ К OCR: захватывает "107324 py6.03", "1673 руб. 24" целиком
+# ФИКС: \d{1,3}(?:\s?\d{3})* ловит "57 329", "57329", "1 000 000"
 MONEY_FALLBACKS = [
-    re.compile(r'\b(\d+(?:[.,]\d{2})?\s+(?:py6\.?\s*\d{2}|py6\s*\d{2}|руб\.?\s*\d{2}|рублей|коп\.?|копеек))\b', re.IGNORECASE),
-    re.compile(r'пени\s+(\d+(?:[.,]\d{2})?)', re.IGNORECASE),
+    re.compile(r'\b(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?\s+(?:py6\.?\s*\d{2}|py6\s*\d{2}|руб\.?\s*\d{2}|рублей|коп\.?|копеек))\b', re.IGNORECASE),
+    re.compile(r'пени\s+(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)', re.IGNORECASE),
 ]
 
-# Фолбэк для госпошлины (на случай, если yargy споткнется о перенос строки)
 GOSPOSHLINA_REGEX = re.compile(r'расход\w*\s+по\s+оплат\w*\s+(?:государствен\w*\s+)?пошлин\w*', re.IGNORECASE | re.DOTALL)
 
 # ==========================================
@@ -199,7 +199,6 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     entities = []
     case_info = extract_case_info(text)
 
-    # НАХОДИМ ГРАНИЦУ РЕЗОЛЮТИВНОЙ ЧАСТИ
     resolution_match = re.search(r'(?:РЕШИЛ:|ПОСТАНОВИЛ:|ОПРЕДЕЛИЛ:|ПРИКАЗЫВАЮ:)', text, re.IGNORECASE)
     resolution_start = resolution_match.end() if resolution_match else 0
     resolution_text = text[resolution_start:]
@@ -212,9 +211,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
-    # ==========================================
-    # А. ГЛОБАЛЬНЫЙ ПОИСК (Имена, Паспорта, Реквизиты, Даты) - по ВСЕМУ тексту
-    # ==========================================
+    # А. ГЛОБАЛЬНЫЙ ПОИСК
     for match in names_extractor(text):
         word = text[match.start:match.stop]
         if len(word.split()) >= 2:
@@ -231,16 +228,16 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     for entity_type, pattern in CUSTOM_PATTERNS.items():
         for match in pattern.finditer(text):
             if entity_type == 'PASSPORT':
-                add_entity(f"{match.group(1)} {match.group(2)}", 'PASSPORT', match.start(), match.end(), 0.95, normal_form=f"{match.group(1)} {match.group(2)}")
+                # Очищаем серию от пробелов для единообразия (40 12 -> 4012)
+                series = match.group(1).replace(' ', '').replace('-', '')
+                number = match.group(2)
+                add_entity(f"{series} {number}", 'PASSPORT', match.start(), match.end(), 0.95, normal_form=f"{series} {number}")
             elif entity_type == 'BANK_ACCOUNT':
                 add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
             else:
                 add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
 
-    # ==========================================
-    # Б. ЛОКАЛЬНЫЙ ПОИСК (SUBJECT, MONEY) - ТОЛЬКО ПОСЛЕ "РЕШИЛ:"
-    # ==========================================
-    # 1. Деньги в резолюции
+    # Б. ЛОКАЛЬНЫЙ ПОИСК (РЕЗОЛЮЦИЯ)
     for match in money_extractor(resolution_text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
             add_entity(resolution_text[match.start:match.stop], f"MONEY_{match.fact.currency}",
@@ -261,7 +258,6 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             if not overlap:
                 add_entity(text_match, 'MONEY_RUB', real_start, real_end, 0.90, currency='RUB', normal_form=text_match)
 
-    # 2. SUBJECT в резолюции (Yargy)
     sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
     for match in DICT_PARSER.findall(resolution_text):
         matched_text = resolution_text[match.span.start:match.span.stop]
@@ -272,19 +268,15 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 add_entity(matched_text, category, match.span.start + resolution_start, match.span.stop + resolution_start, 0.9, normal_form=normal_form)
                 break
 
-    # 3. Фолбэк для госпошлины в резолюции (если yargy не справился из-за переноса строки)
     for match in GOSPOSHLINA_REGEX.finditer(resolution_text):
         matched_text = match.group(0).strip()
         real_start = match.start() + resolution_start
         real_end = match.end() + resolution_start
-        # Проверяем, не добавили ли мы это уже через yargy
         overlap = any(e.start_pos <= real_start < e.end_pos or real_start < e.end_pos <= real_end for e in entities if 'пошлин' in e.text.lower())
         if not overlap:
             add_entity(matched_text, 'SUBJECT', real_start, real_end, 0.9, normal_form="расход оплата государственная пошлина")
 
-    # ==========================================
     # В. ДЕДУПЛИКАЦИЯ
-    # ==========================================
     unique_entities = []
     sorted_entities = sorted(entities, key=lambda x: (x.start_pos, -(x.end_pos - x.start_pos)))
     for e in sorted_entities:
