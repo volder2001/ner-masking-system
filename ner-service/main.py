@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v5: Укрощение regex денег, усиление паспорта и адреса суда
+FINAL PRODUCTION v6: OCR-устойчивый словарь (сохраняет длинные уникальные SUBJECTы) + фикс case_info
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -31,7 +31,8 @@ ADDRESS_MARKERS: Set[str] = {
     'г.', 'город', 'пер.', 'переулок', 'бул.', 'бульвар', 'ш.', 'шоссе',
     'ул', 'пр', 'д', 'кв', 'г', 'пер', 'бул', 'ш',
     'обл.', 'область', 'р-н', 'район', 'с.', 'село', 'п.', 'поселок',
-    'мкр.', 'микрорайон', 'наб.', 'набережная', 'туп.', 'тупик'
+    'мкр.', 'микрорайон', 'наб.', 'набережная', 'туп.', 'тупик',
+    'республика', 'республики', 'край', 'края', 'автономный округ' # <-- Защита от ложных NAME
 }
 
 DICT_PATH = Path("/app/data/dictionary.json")
@@ -43,24 +44,53 @@ def load_dictionary():
 
 dictionary = load_dictionary()
 
-phrase_to_category = {}
-all_phrases = []
+# ==========================================
+# 2. ГЕНЕРАТОР OCR-УСТОЙЧИВЫХ REGEX ДЛЯ СЛОВАРЯ
+# ==========================================
+COMPILED_DICT_REGEXES = []
+
+def build_ocr_resilient_regex(phrase: str) -> re.Pattern:
+    """
+    Превращает фразу из словаря в гибкий regex, устойчивый к пропущенным предлогам
+    и мелким опечаткам OCR (например, "нсустойка" или "связи" вместо "в связи с").
+    """
+    # Убираем пунктуацию для анализа слов
+    clean_phrase = re.sub(r'[^\w\s]', ' ', phrase)
+    words = clean_phrase.split()
+
+    significant_words = []
+    for w in words:
+        p = morph.parse(w)[0]
+        # Оставляем только знаменательные части речи
+        if not ('PREP' in p.tag.grammemes or 'CONJ' in p.tag.grammemes or 'PRCL' in p.tag.grammemes):
+            significant_words.append(w)
+
+    regex_parts = []
+    for w in significant_words:
+        w_lower = w.lower()
+        # Хак 1: Разрешаем пропуск 'е' или 'ё' после 'н' (неустойка -> нсустойка)
+        if w_lower.startswith('не'):
+            w_regex = r'н[её]?' + w[2:]
+        else:
+            w_regex = w
+
+        # Хак 2: Делаем последнюю гласную опциональной (связи -> связ, кредита -> кредит)
+        w_regex = re.sub(r'([аеёиоуыэюя])$', r'[\1]?', w_regex, flags=re.IGNORECASE)
+        regex_parts.append(w_regex)
+
+    # Соединяем ключевые слова через .*? (допускает любые символы, пробелы, переносы строк между ними)
+    pattern_str = r'\b' + r'.*?'.join(regex_parts) + r'\b'
+    return re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
+
+# Компилируем все фразы из словаря
 for category, phrases in dictionary.items():
     for phrase in phrases:
-        phrase_to_category[phrase.lower()] = category
-        all_phrases.append(phrase)
-
-DictEntity = fact('DictEntity', ['text'])
-DICT_RULE = morph_pipeline(all_phrases).interpretation(DictEntity.text.normalized())
-DICT_PARSER = Parser(DICT_RULE)
-
-DATE_REGEXES = [
-    re.compile(r'\b\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}\b'),
-    re.compile(r'["\']?\d{1,2}["\']?\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{2,4}\s*г\.?', re.IGNORECASE)
-]
+        regex = build_ocr_resilient_regex(phrase)
+        # Сохраняем оригинальную фразу как нормальную форму, чтобы не терять смысл!
+        COMPILED_DICT_REGEXES.append((regex, category, phrase))
 
 # ==========================================
-# КАСТОМНЫЕ REGEX-ПАТТЕРНЫ (БЕЗОПАСНЫЕ)
+# 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ
 # ==========================================
 CUSTOM_PATTERNS = {
     'INN': re.compile(r'\bИНН\s*(\d{10}|\d{12})\b'),
@@ -68,21 +98,17 @@ CUSTOM_PATTERNS = {
     'OGRN': re.compile(r'\bОГРН\s*(\d{13}|\d{15})\b'),
     'BIK': re.compile(r'\bБИК\s*(04\d{7})\b'),
     'BANK_ACCOUNT': re.compile(r'(?:р/с|расч[её]т\.?|корр\.?\s*сч[её]т\.?)\s*(\d{20})\b'),
-    # Паспорт: .*? позволяет игнорировать переносы строк и мусор OCR между словами
     'PASSPORT': re.compile(r'паспорт.*?(?:серии?\s+)?(\d{4}).*?(?:номер\s+)?(\d{6})\b', re.IGNORECASE | re.DOTALL),
     'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
 
-# БЕЗОПАСНЫЕ и УСТОЙЧИВЫЕ fallback-правила для денег
 MONEY_FALLBACKS = [
-    # 1. Любое число + валюта (например, "84515,59 руб." или "1665.39 рублей")
     re.compile(r'\b(\d+(?:[.,]\d{2})?)\s+(?:руб\.|рублей|коп\.|копеек)\b', re.IGNORECASE),
-    # 2. Число после слова "пени" (группа 1 захватывает только число, чтобы не поглощать SUBJECT "пени")
     re.compile(r'пени\s+(\d+(?:[.,]\d{2})?)', re.IGNORECASE),
 ]
 
 # ==========================================
-# 2. МОДЕЛИ ДАННЫХ
+# 4. МОДЕЛИ ДАННЫХ
 # ==========================================
 class Entity(BaseModel):
     text: str
@@ -108,20 +134,15 @@ class NERResponse(BaseModel):
     case_info: Optional[Dict] = None
 
 # ==========================================
-# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 def extract_case_info(text: str) -> Dict:
-    case_info = {
-        'case_number': None, 'case_date': None, 'court_name': None,
-        'court_address': None, 'judge_name': None
-    }
+    case_info = {'case_number': None, 'case_date': None, 'court_name': None, 'court_address': None, 'judge_name': None}
 
-    # 1. Номер дела
-    case_number_match = re.search(r'(?:Дело\s+|дело\s+№?\s*)?(\d+[-/]\d+[/\d]*)', text)
+    case_number_match = re.search(r'(?:Дело\s+|дело\s+№?\s*|Производство\s+)?(\d+[-/]\d+[/\d]*)', text)
     if case_number_match:
         case_info['case_number'] = case_number_match.group(1)
 
-    # 2. Дата дела
     date_match = re.search(r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})', text, re.IGNORECASE)
     if date_match:
         case_info['case_date'] = date_match.group(1)
@@ -130,20 +151,20 @@ def extract_case_info(text: str) -> Dict:
         if date_match2:
             case_info['case_date'] = date_match2.group(1)
 
-    # 3. Наименование суда (до индекса или e-mail)
-    court_name_match = re.search(r'^(.+?)(?=\d{6},|e-mail:|Именем)', text, re.DOTALL | re.IGNORECASE)
+    court_name_match = re.search(r'^(.+?)(?=\d{6},|Именем)', text, re.DOTALL | re.IGNORECASE)
     if court_name_match:
         case_info['court_name'] = re.sub(r'\s+', ' ', court_name_match.group(1)).strip()
 
-    # 4. Адрес суда (от индекса до e-mail, игнорируя переносы строк)
-    court_address_match = re.search(r'(\d{6},\s*.*?)(?=e-mail:|$)', text, re.DOTALL | re.IGNORECASE)
+    # Останавливаем адрес на "сайт", "@" или "Именем"
+    court_address_match = re.search(r'(\d{6},\s*.*?)(?:сайт|e-mail|@|Именем|$)', text, re.DOTALL | re.IGNORECASE)
     if court_address_match:
         case_info['court_address'] = re.sub(r'\s+', ' ', court_address_match.group(1)).strip()
 
-    # 5. ФИО судьи
+    # Поддержка форматов "Фамилия И.О." и "И.О.Фамилия"
     judge_patterns = [
-        r'(?:Югры|области|края|республики)\s+([А-Яа-яA-Za-z]+\s+[A-Za-zА-Яа-я]\.?\s*[A-Za-zА-Яа-я]\.?)',
-        r'Мировой судья\s+([А-Яа-яA-Za-z]+\s+[A-Za-zА-Яа-я]\.?\s*[A-Za-zА-Яа-я]\.?)'
+        r'Мировой судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
+        r'Мировой судья\s+([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Яа-яA-Za-z]+)', # Ю.Т.Шакирьянова
+        r'судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)'
     ]
     for pattern in judge_patterns:
         judge_match = re.search(pattern, text)
@@ -161,18 +182,8 @@ def is_address_context(text: str, start_pos: int) -> bool:
             return True
     return False
 
-def get_phrase_normal_form(phrase: str) -> str:
-    words = phrase.split()
-    normal_words = []
-    for word in words:
-        parsed = morph.parse(word)[0]
-        if 'PREP' in parsed.tag.grammemes or 'CONJ' in parsed.tag.grammemes:
-            continue
-        normal_words.append(parsed.normal_form)
-    return ' '.join(normal_words) if normal_words else phrase
-
 # ==========================================
-# 4. ЛОГИКА ИЗВЛЕЧЕНИЯ
+# 6. ЛОГИКА ИЗВЛЕЧЕНИЯ
 # ==========================================
 def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     entities = []
@@ -189,16 +200,15 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     # 1. ДЕНЬГИ (Natasha)
     for match in money_extractor(text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
-            word = text[match.start:match.stop]
-            add_entity(word, f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
+            add_entity(text[match.start:match.stop], f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
 
-    # 1.1 ДЕНЬГИ (Безопасные Fallback Regex)
+    # 1.1 ДЕНЬГИ (Fallback Regex)
     for pattern in MONEY_FALLBACKS:
         for match in pattern.finditer(text):
-            # Если в паттерне есть группы (как у "пени"), берем координаты и текст только числа (группа 1)
-            start = match.start(1) if pattern.groups > 0 else match.start()
-            end = match.end(1) if pattern.groups > 0 else match.end()
-            text_match = match.group(1) if pattern.groups > 0 else match.group(0)
+            if pattern.pattern.startswith('пени'):
+                text_match, start, end = match.group(1), match.start(1), match.end(1)
+            else:
+                text_match, start, end = match.group(0), match.start(), match.end()
 
             overlap = any(e.start_pos <= start < e.end_pos for e in entities if e.type.startswith('MONEY'))
             if not overlap:
@@ -206,9 +216,8 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 
     # 2. ДАТЫ
     for match in date_extractor(text):
-        word = text[match.start:match.stop]
-        add_entity(word, 'DATE', match.start, match.stop, 0.95)
-    for pattern in DATE_REGEXES:
+        add_entity(text[match.start:match.stop], 'DATE', match.start, match.stop, 0.95)
+    for pattern in [re.compile(r'\b\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}\b'), re.compile(r'["\']?\d{1,2}["\']?\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{2,4}\s*г\.?', re.IGNORECASE)]:
         for match in pattern.finditer(text):
             add_entity(match.group(0), 'DATE', match.start(), match.end(), 0.95)
 
@@ -220,20 +229,23 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 if not any(char.isascii() and char.isalpha() for char in word):
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ
-    for match in DICT_PARSER.findall(text):
-        original_text = text[match.span.start:match.span.stop]
-        normalized_text = match.fact.text.lower() if hasattr(match.fact, 'text') else str(match.fact).lower()
-        category = phrase_to_category.get(normalized_text, 'SUBJECT')
-        normal_form = get_phrase_normal_form(original_text)
-        add_entity(word=original_text, entity_type=category, start=match.span.start, end=match.span.stop, conf=0.9, normal_form=normal_form)
+    # 4. СЛОВАРЬ (OCR-УСТОЙЧИВЫЙ ПОИСК)
+    # Сортируем по длине фразы (desc), чтобы длинные уникальные фразы матчились первыми и блокировали короткие
+    sorted_dict_regexes = sorted(COMPILED_DICT_REGEXES, key=lambda x: len(x[2]), reverse=True)
+
+    for regex, category, original_phrase in sorted_dict_regexes:
+        for match in regex.finditer(text):
+            matched_text = match.group(0)
+            # Проверяем, не перекрыто ли это совпадение уже найденной более длинной/ранней сущностью
+            overlap = any(e.start_pos <= match.start() < e.end_pos or e.start_pos < match.end() <= e.end_pos for e in entities)
+            if not overlap:
+                add_entity(matched_text, category, match.start(), match.end(), 0.9, normal_form=original_phrase)
 
     # 5. КАСТОМНЫЕ РЕКВИЗИТЫ
     for entity_type, pattern in CUSTOM_PATTERNS.items():
         for match in pattern.finditer(text):
             if entity_type == 'PASSPORT':
-                full_text = f"{match.group(1)} {match.group(2)}"
-                add_entity(full_text, 'PASSPORT', match.start(), match.end(), 0.95, normal_form=full_text)
+                add_entity(f"{match.group(1)} {match.group(2)}", 'PASSPORT', match.start(), match.end(), 0.95, normal_form=f"{match.group(1)} {match.group(2)}")
             elif entity_type == 'BANK_ACCOUNT':
                 add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
             else:
@@ -255,9 +267,11 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 
 
 def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
+    subjects = [e for e in entities if e.type in ['SUBJECT', 'NOT_SUBJECT']] # Включаем оба типа для связывания, если нужно
+    # Но по логике задачи мы связываем только SUBJECT с деньгами
     subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
-    WINDOW_SIZE = 200
+    WINDOW_SIZE = 250 # Чуть увеличили для длинных фраз
 
     candidates = []
     for subj in subjects:
@@ -300,7 +314,7 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
     return final_pairs
 
 # ==========================================
-# 5. API ENDPOINTS
+# 7. API ENDPOINTS
 # ==========================================
 @app.get("/")
 def read_root():
