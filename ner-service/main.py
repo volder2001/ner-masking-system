@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v20: Полный фикс пробелов в паспортах/суммах, SUBJECT фолбэки с поддержкой \n, чистка judge_name
+FINAL PRODUCTION v21: Фикс денег с переносом строки (242 637,21\nруб.), чистка judge_name и court_address
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -83,7 +83,7 @@ def normalize_matched_text(matched_text: str) -> str:
     return " ".join(norm_words) if norm_words else matched_text
 
 # ==========================================
-# 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ (С ФИКСАМИ ПРОБЕЛОВ И ПЕРЕНОСОВ)
+# 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ (С ФИКСАМИ)
 # ==========================================
 CUSTOM_PATTERNS = {
     'INN': re.compile(r'\bИНН\s*(\d{10}|\d{12})\b'),
@@ -91,18 +91,16 @@ CUSTOM_PATTERNS = {
     'OGRN': re.compile(r'\bОГРН\s*(\d{13}|\d{15})\b'),
     'BIK': re.compile(r'\bБИК\s*(04\d{7})\b'),
     'BANK_ACCOUNT': re.compile(r'(?:р/с|расч[её]т\.?|корр\.?\s*сч[её]т\.?)\s*(\d{20})\b'),
-    # ФИКС: (\d{2}\s?\d{2}|\d{4}) ловит и "4012", и "40 12"
     'PASSPORT': re.compile(r'паспорт.*?(?:серии?\s+)?(\d{2}\s?\d{2}|\d{4}).*?(?:номер\s+)?(\d{6})\b', re.IGNORECASE | re.DOTALL),
     'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
 
-# ФИКС: \d{1,3}(?:\s?\d{3})* ловит "57 329", "57329", "1 000 000"
+# ФИКС: Корректно ловит "242 637,21\nруб.", "57 329 руб. 92 коп.", "727,36 руб."
 MONEY_FALLBACKS = [
-    re.compile(r'\b(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?\s+(?:py6\.?\s*\d{2}|py6\s*\d{2}|руб\.?\s*\d{2}|рублей|коп\.?|копеек))\b', re.IGNORECASE),
+    re.compile(r'(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)\s+((?:руб\.?(?:\s*\d{1,2})?)|рублей|(?:коп\.?(?:\s*\d{1,2})?)|копеек|(?:py6\.?(?:\s*\d{1,2})?))', re.IGNORECASE),
     re.compile(r'пени\s+(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)', re.IGNORECASE),
 ]
 
-# НОВЫЕ Фолбэки для SUBJECT, устойчивые к переносам строк (\s+ вместо пробела)
 SUBJECT_FALLBACKS = [
     (re.compile(r'задолженност\w*\s+по\s+кредит\w*\s+договор\w*', re.IGNORECASE | re.DOTALL), "задолженность кредитный договор"),
     (re.compile(r'задолженност\w*\s+по\s+уплат\w*\s+процент\w*', re.IGNORECASE | re.DOTALL), "задолженность уплата процент"),
@@ -171,21 +169,20 @@ def extract_case_info(text: str) -> Dict:
     if court_lines:
         case_info['court_name'] = ' '.join(court_lines).strip()
 
-    addr_match = re.search(r'(\d{6},\s*.*?(?:ул\.|улица|г\.|город|пр\.|проспект).*?)(?=\n\n|Именем|сайт|e-mail|@|$)', header, re.IGNORECASE | re.DOTALL)
+    # ФИКС: Добавлены стоп-слова должнику, взыскателя, РЕШИЛ: чтобы не захватывать лишний текст
+    addr_match = re.search(r'(\d{6},\s*.*?(?:ул\.|улица|г\.|город|пр\.|проспект).*?)(?=\n\n|Именем|сайт|e-mail|@|должнику|взыскателя|РЕШИЛ:|$)', header, re.IGNORECASE | re.DOTALL)
     if addr_match:
         case_info['court_address'] = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
 
+    # ФИКС: Паттерн с инициалами (И.О. Фамилия) стоит ПЕРВЫМ, чтобы перехватить чистую подпись в конце
     judge_patterns = [
-        r'Мировой судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
-        r'Мировой судья\s+([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Яа-яA-Za-z]+)',
+        r'([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Яа-яA-Za-z]+)', # И.О. Фамилия (наивысший приоритет)
+        r'Мировой судья\s+(?:.*?\s+)?([А-Я][а-я]+)(?:\s+рассмотрев|\n|$)', # Фамилия после "Мировой судья"
         r'судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
-        r'([А-Яа-яA-Za-z]+\s+[А-Яа-яA-Za-z]+\s+[А-Яа-яA-Za-z]+)[\s,]*рассмотрев',
-        r'([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)[\s,]*рассмотрев',
     ]
     for pattern in judge_patterns:
         judge_match = re.search(pattern, header)
         if judge_match:
-            # ФИКС: Заменяем переносы строк на пробелы и убираем лишние пробелы
             case_info['judge_name'] = re.sub(r'\s+', ' ', judge_match.group(1)).strip()
             break
 
@@ -218,7 +215,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
-    # А. ГЛОБАЛЬНЫЙ ПОИСК (Имена, Даты, Реквизиты)
+    # А. ГЛОБАЛЬНЫЙ ПОИСК
     for match in names_extractor(text):
         word = text[match.start:match.stop]
         if len(word.split()) >= 2:
@@ -243,7 +240,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             else:
                 add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
 
-    # Б. ЛОКАЛЬНЫЙ ПОИСК (РЕЗОЛЮЦИЯ: SUBJECT и MONEY)
+    # Б. ЛОКАЛЬНЫЙ ПОИСК (РЕЗОЛЮЦИЯ)
     for match in money_extractor(resolution_text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
             add_entity(resolution_text[match.start:match.stop], f"MONEY_{match.fact.currency}",
@@ -251,10 +248,9 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 
     for pattern in MONEY_FALLBACKS:
         for match in pattern.finditer(resolution_text):
-            if pattern.pattern.startswith('пени'):
-                text_match, start, end = match.group(1), match.start(1), match.end(1)
-            else:
-                text_match, start, end = match.group(0), match.start(), match.end()
+            # Группа 0 - это всё совпадение целиком (например, "242 637,21\nруб.")
+            text_match = match.group(0)
+            start, end = match.start(), match.end()
 
             text_match = re.sub(r'\s+', ' ', text_match).strip()
             real_start = start + resolution_start
@@ -264,7 +260,6 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             if not overlap:
                 add_entity(text_match, 'MONEY_RUB', real_start, real_end, 0.90, currency='RUB', normal_form=text_match)
 
-    # 1. SUBJECT через Yargy
     sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
     for match in DICT_PARSER.findall(resolution_text):
         matched_text = resolution_text[match.span.start:match.span.stop]
@@ -275,11 +270,10 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 add_entity(matched_text, category, match.span.start + resolution_start, match.span.stop + resolution_start, 0.9, normal_form=normal_form)
                 break
 
-    # 2. SUBJECT через Фолбэк-регексы (устойчивые к переносам строк)
     for pattern, normal_form in SUBJECT_FALLBACKS:
         for match in pattern.finditer(resolution_text):
             matched_text = match.group(0).strip()
-            clean_matched = re.sub(r'\s+', ' ', matched_text) # Убираем переносы строк для чистоты
+            clean_matched = re.sub(r'\s+', ' ', matched_text)
             real_start = match.start() + resolution_start
             real_end = match.end() + resolution_start
 
