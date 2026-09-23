@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v4: Исправление адресов, судей, поиск по всему тексту + страховка для денег
+FINAL PRODUCTION v5: Укрощение regex денег, усиление паспорта и адреса суда
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -60,7 +60,7 @@ DATE_REGEXES = [
 ]
 
 # ==========================================
-# КАСТОМНЫЕ REGEX-ПАТТЕРНЫ (УСИЛЕННЫЕ)
+# КАСТОМНЫЕ REGEX-ПАТТЕРНЫ (БЕЗОПАСНЫЕ)
 # ==========================================
 CUSTOM_PATTERNS = {
     'INN': re.compile(r'\bИНН\s*(\d{10}|\d{12})\b'),
@@ -68,18 +68,18 @@ CUSTOM_PATTERNS = {
     'OGRN': re.compile(r'\bОГРН\s*(\d{13}|\d{15})\b'),
     'BIK': re.compile(r'\bБИК\s*(04\d{7})\b'),
     'BANK_ACCOUNT': re.compile(r'(?:р/с|расч[её]т\.?|корр\.?\s*сч[её]т\.?)\s*(\d{20})\b'),
-    # Паспорт: более гибкий, допускает "серии", "номер", переносы строк
-    'PASSPORT': re.compile(r'\bпаспорт\s+(?:гражданина\s+РФ\s+)?(?:серии?\s+)?(\d{4})\s+(?:номер\s+)?(\d{6})\b', re.IGNORECASE | re.DOTALL),
+    # Паспорт: .*? позволяет игнорировать переносы строк и мусор OCR между словами
+    'PASSPORT': re.compile(r'паспорт.*?(?:серии?\s+)?(\d{4}).*?(?:номер\s+)?(\d{6})\b', re.IGNORECASE | re.DOTALL),
     'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
 
-# Страховочный Regex для денег (ловит числа с запятой, если Natasha пропустила)
-MONEY_FALLBACK_REGEX = re.compile(r'\b(\d{1,3}(?:\s?\d{3})*(?:,\d{2})?)\s*(?:руб\.|рублей|коп\.|копеек)?\b')
-
-ADDRESS_REGEX = re.compile(
-    r'(?:адрес регистрации|адрес|проживающий по\s+адресу|юридический адрес|почтовый адрес)\s*:\s*([^\n]+)',
-    re.IGNORECASE
-)
+# БЕЗОПАСНЫЕ fallback-правила для денег (только целевые!)
+MONEY_FALLBACKS = [
+    # 1. Строгое требование валюты
+    re.compile(r'\b(\d{1,3}(?:\s?\d{3})*(?:,\d{2})?)\s+(?:руб\.|рублей|коп\.|копеек)\b', re.IGNORECASE),
+    # 2. Специфично для "пени [число]" (как в примере "пени 22023,65,")
+    re.compile(r'пени\s+(\d{1,3}(?:\s?\d{3})*(?:,\d{2})?)', re.IGNORECASE),
+]
 
 # ==========================================
 # 2. МОДЕЛИ ДАННЫХ
@@ -111,13 +111,9 @@ class NERResponse(BaseModel):
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 def extract_case_info(text: str) -> Dict:
-    """Извлекает информацию о деле из всего текста, но фокусируется на шапке"""
     case_info = {
-        'case_number': None,
-        'case_date': None,
-        'court_name': None,
-        'court_address': None,
-        'judge_name': None
+        'case_number': None, 'case_date': None, 'court_name': None,
+        'court_address': None, 'judge_name': None
     }
 
     # 1. Номер дела
@@ -134,22 +130,17 @@ def extract_case_info(text: str) -> Dict:
         if date_match2:
             case_info['case_date'] = date_match2.group(1)
 
-    # 3. Наименование суда (первые 2-3 строки до адреса или e-mail)
-    court_name_match = re.search(r'^(.+?)(?=\d{6}|e-mail:|Именем)', text, re.DOTALL | re.IGNORECASE)
+    # 3. Наименование суда (до индекса или e-mail)
+    court_name_match = re.search(r'^(.+?)(?=\d{6},|e-mail:|Именем)', text, re.DOTALL | re.IGNORECASE)
     if court_name_match:
-        case_info['court_name'] = court_name_match.group(1).strip()
+        case_info['court_name'] = re.sub(r'\s+', ' ', court_name_match.group(1)).strip()
 
-    # 4. Адрес суда (ищем почтовый индекс и маркеры адреса, допускаем переносы строк)
-    court_address_match = re.search(
-        r'(\d{6},\s*.+?(?:ул\.|улица|пр\.|проспект|д\.|дом|кв\.).*?)(?=\n\w|e-mail:|$)',
-        text, re.DOTALL | re.IGNORECASE
-    )
+    # 4. Адрес суда (от индекса до e-mail, игнорируя переносы строк)
+    court_address_match = re.search(r'(\d{6},\s*.*?)(?=e-mail:|$)', text, re.DOTALL | re.IGNORECASE)
     if court_address_match:
-        # Очищаем от лишних переносов строк для красоты
         case_info['court_address'] = re.sub(r'\s+', ' ', court_address_match.group(1)).strip()
 
-    # 5. ФИО судьи (ищем после названия региона или в конце документа)
-    # Допускаем латинские H и N из-за ошибок OCR
+    # 5. ФИО судьи
     judge_patterns = [
         r'(?:Югры|области|края|республики)\s+([А-Яа-яA-Za-z]+\s+[A-Za-zА-Яа-я]\.?\s*[A-Za-zА-Яа-я]\.?)',
         r'Мировой судья\s+([А-Яа-яA-Za-z]+\s+[A-Za-zА-Яа-я]\.?\s*[A-Za-zА-Яа-я]\.?)'
@@ -185,8 +176,6 @@ def get_phrase_normal_form(phrase: str) -> str:
 # ==========================================
 def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     entities = []
-
-    # Извлекаем информацию о деле из всего текста
     case_info = extract_case_info(text)
 
     def add_entity(word: str, entity_type: str, start: int, end: int, conf: float, currency: str = None, normal_form: str = None):
@@ -203,12 +192,18 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             word = text[match.start:match.stop]
             add_entity(word, f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
 
-    # 1.1 ДЕНЬГИ (Fallback Regex для случаев типа "22023,65")
-    for match in MONEY_FALLBACK_REGEX.finditer(text):
-        # Проверяем, не перекрывается ли уже найденное Natasha
-        overlap = any(e.start_pos <= match.start() < e.end_pos for e in entities if e.type.startswith('MONEY'))
-        if not overlap:
-            add_entity(match.group(1), 'MONEY_RUB', match.start(), match.end(), 0.90, currency='RUB')
+    # 1.1 ДЕНЬГИ (Безопасные Fallback Regex)
+    for pattern in MONEY_FALLBACKS:
+        for match in pattern.finditer(text):
+            # Проверяем, не перекрывается ли уже найденное Natasha
+            overlap = any(e.start_pos <= match.start() < e.end_pos for e in entities if e.type.startswith('MONEY'))
+            if not overlap:
+                # Для паттерна "пени [число]" добавляем слово "пени" в текст для контекста
+                full_match_text = match.group(0)
+                if not re.search(r'руб|коп', full_match_text, re.IGNORECASE):
+                    full_match_text = f"пени {match.group(1)}" # Восстанавливаем контекст
+
+                add_entity(full_match_text, 'MONEY_RUB', match.start(), match.end(), 0.90, currency='RUB')
 
     # 2. ДАТЫ
     for match in date_extractor(text):
@@ -245,13 +240,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             else:
                 add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
 
-    # 6. АДРЕСА
-    for match in ADDRESS_REGEX.finditer(text):
-        address_text = match.group(1).strip()
-        if any(m in address_text.lower() for m in ADDRESS_MARKERS):
-            add_entity(address_text, 'ADDRESS', match.start(1), match.end(1), 0.9, normal_form=address_text)
-
-    # 7. ДЕДУПЛИКАЦИЯ
+    # 6. ДЕДУПЛИКАЦИЯ
     unique_entities = []
     sorted_entities = sorted(entities, key=lambda x: (x.start_pos, -(x.end_pos - x.start_pos)))
     for e in sorted_entities:
@@ -269,7 +258,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
     subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
-    WINDOW_SIZE = 200  # Немного увеличили окно для сложных юридических фраз
+    WINDOW_SIZE = 200
 
     candidates = []
     for subj in subjects:
@@ -278,11 +267,7 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
             if distance < 0:
                 distance = 9999
             if distance <= WINDOW_SIZE:
-                candidates.append({
-                    'subject': subj,
-                    'money': money,
-                    'distance': distance
-                })
+                candidates.append({'subject': subj, 'money': money, 'distance': distance})
 
     candidates.sort(key=lambda x: x['distance'])
 
@@ -297,27 +282,20 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
         if subj_id not in used_subjects and money_id not in used_moneys:
             used_subjects.add(subj_id)
             used_moneys.add(money_id)
-
             context_start = candidate['subject'].start_pos
             context_end = min(candidate['money'].end_pos + 40, len(text))
-            context = text[context_start:context_end]
 
             final_pairs.append(SubjectMoneyPair(
                 subject=candidate['subject'],
                 money=candidate['money'],
                 distance=candidate['distance'],
-                context=context
+                context=text[context_start:context_end]
             ))
 
     for subj in subjects:
         subj_id = (subj.start_pos, subj.end_pos)
         if subj_id not in used_subjects:
-            final_pairs.append(SubjectMoneyPair(
-                subject=subj,
-                money=None,
-                distance=None,
-                context=None
-            ))
+            final_pairs.append(SubjectMoneyPair(subject=subj, money=None, distance=None, context=None))
 
     final_pairs.sort(key=lambda x: x.subject.start_pos)
     return final_pairs
@@ -327,12 +305,7 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
 # ==========================================
 @app.get("/")
 def read_root():
-    return {
-        "status": "ok",
-        "service": "ner-service",
-        "dict_loaded_total": len(dictionary),
-        "phrases_in_pipeline": all_phrases
-    }
+    return {"status": "ok", "service": "ner-service", "dict_loaded_total": len(dictionary)}
 
 @app.post("/extract", response_model=NERResponse)
 def extract(request: NERRequest):
