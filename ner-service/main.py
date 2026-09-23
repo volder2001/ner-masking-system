@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v8: Ограниченная морфологическая регулярка (безопасный \w* вместо .*?)
+FINAL PRODUCTION v10: Умная морфология (предлоги опциональны, значимые слова строги)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -42,43 +42,59 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. БЕЗОПАСНЫЙ ГЕНЕРАТОР REGEX ДЛЯ СЛОВАРЯ
+# 2. УМНЫЙ ГЕНЕРАТОР REGEX ДЛЯ СЛОВАРЯ
 # ==========================================
 COMPILED_DICT_REGEXES = []
 
-def build_safe_morph_regex(phrase: str) -> Optional[re.Pattern]:
+def build_ocr_resilient_regex(phrase: str) -> Optional[re.Pattern]:
     """
-    Строит regex из лемм, разрешая любые окончания (\w*), но требуя,
-    чтобы слова шли друг за другом (\s+). Это предотвращает 'поедание' цифр.
+    Строит regex, где значимые слова обязательны и идут по порядку,
+    а служебные слова (предлоги, союзы) опциональны. Это решает проблему
+    выкинутых OCR слов (например, "в связи" -> "связи").
     """
     words = phrase.split()
-    regex_parts = []
+    parsed_words = []
 
     for w in words:
-        p = morph.parse(w)[0]
-        # Игнорируем предлоги и союзы (они часто выпадают при OCR)
-        if 'PREP' in p.tag.grammemes or 'CONJ' in p.tag.grammemes or 'PRCL' in p.tag.grammemes:
+        # Очищаем от пунктуации для корректного морфологического разбора
+        clean_w = re.sub(r'[^\w\s]', '', w)
+        if not clean_w:
             continue
+        p = morph.parse(clean_w)[0]
+        parsed_words.append((clean_w, p))
 
-        lemma = p.normal_form.lower()
-        # Хак для частой OCR-ошибки: неустойка -> н[её]?устойка (ловит "нсустойка")
-        lemma = re.sub(r'н([её])', r'н[её]?', lemma)
-
-        # Разрешаем любое словообразование/окончание после леммы
-        lemma_regex = lemma + r'\w*'
-        regex_parts.append(lemma_regex)
-
-    if not regex_parts:
+    if not parsed_words:
         return None
 
-    # Соединяем через \s+ (пробелы, табы, переносы строк), но НЕ через .*?
-    pattern_str = r'\b' + r'\s+'.join(regex_parts) + r'\b'
+    regex_parts = []
+    for i, (clean_w, p) in enumerate(parsed_words):
+        lemma = p.normal_form.lower()
+
+        # Хак для частой OCR-ошибки: неустойка -> н[её]?устойка
+        lemma = re.sub(r'^н([её])', r'н[её]?', lemma)
+
+        lemma_regex = lemma + r'\w*'
+
+        is_service_word = 'PREP' in p.tag.grammemes or 'CONJ' in p.tag.grammemes or 'PRCL' in p.tag.grammemes
+
+        if is_service_word:
+            # Служебное слово опционально
+            regex_parts.append(r'(?:\s*' + lemma_regex + r'\s+)?')
+        else:
+            if i == len(parsed_words) - 1:
+                # Последнее значимое слово без требования пробела после
+                regex_parts.append(lemma_regex)
+            else:
+                # Значимое слово с требованием пробела после
+                regex_parts.append(lemma_regex + r'\s+')
+
+    pattern_str = r'\b' + ''.join(regex_parts) + r'\b'
     return re.compile(pattern_str, re.IGNORECASE)
 
 # Компилируем все фразы из словаря
 for category, phrases in dictionary.items():
     for phrase in phrases:
-        regex = build_safe_morph_regex(phrase)
+        regex = build_ocr_resilient_regex(phrase)
         if regex:
             COMPILED_DICT_REGEXES.append((regex, category, phrase))
 
@@ -130,7 +146,6 @@ class NERResponse(BaseModel):
 # 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 def extract_case_info(text: str) -> Dict:
-    """Извлекает информацию о деле ТОЛЬКО из шапки (до РЕШИЛ/ПОСТАНОВИЛ)"""
     header_match = re.search(r'^(.*?)(?:РЕШИЛ:|ПОСТАНОВИЛ:|ОПРЕДЕЛИЛ:|ПРИКАЗЫВАЮ:)', text, re.IGNORECASE | re.DOTALL)
     header = header_match.group(1) if header_match else ""
 
@@ -231,14 +246,13 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 if not any(char.isascii() and char.isalpha() for char in word):
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (БЕЗОПАСНЫЙ МОРФОЛОГИЧЕСКИЙ ПОИСК)
+    # 4. СЛОВАРЬ (УМНАЯ МОРФОЛОГИЯ)
     # Сортируем по длине оригинальной фразы (desc), чтобы длинные фразы блокировали короткие
     sorted_dict_regexes = sorted(COMPILED_DICT_REGEXES, key=lambda x: len(x[2]), reverse=True)
 
     for regex, category, original_phrase in sorted_dict_regexes:
         for match in regex.finditer(text):
             matched_text = match.group(0).strip()
-            # Проверяем перекрытие
             overlap = any(e.start_pos <= match.start() < e.end_pos or e.start_pos < match.end() <= e.end_pos for e in entities)
             if not overlap and len(matched_text) > 2:
                 add_entity(matched_text, category, match.start(), match.end(), 0.9, normal_form=original_phrase)
