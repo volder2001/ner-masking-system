@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v15: Yargy + Smart Length/Significant Words Filter (Решает проблему опечаток OCR и коротких слов)
+FINAL PRODUCTION v16: Устойчивость к OCR-мусору в деньгах (py6), фикс судьи и номера дела
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -45,7 +45,7 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. YARGY + SMART FILTER ДЛЯ СЛОВАРЯ
+# 2. YARGY + SMART FILTER
 # ==========================================
 phrase_to_category = {}
 all_phrases = []
@@ -56,33 +56,23 @@ for category, phrases in dictionary.items():
         all_phrases.append(clean_phrase)
         phrase_to_category[clean_phrase.lower()] = category
 
-# Используем yargy без .normalized(), чтобы избежать галлюцинаций
 DICT_RULE = morph_pipeline(all_phrases)
 DICT_PARSER = Parser(DICT_RULE)
 
 STOP_WORDS = {'в', 'на', 'по', 'за', 'с', 'к', 'у', 'о', 'об', 'от', 'до', 'из', 'под', 'над', 'и', 'а', 'но', 'или', 'же', 'бы', 'ли', 'то'}
 
 def is_valid_dict_match(matched_text: str, clean_phrase: str) -> bool:
-    """Проверяет, что yargy не выцепил случайное короткое слово вместо длинной фразы"""
-    # 1. Проверка длины: найденный текст должен быть не менее 60% от длины фразы в словаре
     if len(matched_text) < len(clean_phrase) * 0.60:
         return False
-
-    # 2. Проверка значимых слов: должно быть не менее 70% совпадений
     matched_words = set(re.findall(r'\w+', matched_text.lower()))
     phrase_words = set(re.findall(r'\w+', clean_phrase.lower()))
-
     matched_sig = matched_words - STOP_WORDS
     phrase_sig = phrase_words - STOP_WORDS
-
-    if not phrase_sig: # Если в фразе только предлоги (маловероятно, но на всякий случай)
-        return True
-
+    if not phrase_sig: return True
     overlap_ratio = len(matched_sig & phrase_sig) / len(phrase_sig)
     return overlap_ratio >= 0.70
 
 def normalize_matched_text(matched_text: str) -> str:
-    """Честно нормализует именно тот текст, который был найден, убирая предлоги"""
     norm_words = []
     for w in matched_text.split():
         clean_w = re.sub(r'[^\w]', '', w)
@@ -105,8 +95,9 @@ CUSTOM_PATTERNS = {
     'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
 
+# УСТОЙЧИВОСТЬ К OCR: py6, py6., руб, руб.
 MONEY_FALLBACKS = [
-    re.compile(r'\b(\d+(?:[.,]\d{2})?)\s+(?:руб\.|рублей|коп\.|копеек)\b', re.IGNORECASE),
+    re.compile(r'\b(\d+(?:[.,]\d{2})?)\s*(?:py6\.?|py6|руб\.?|рублей|коп\.?|копеек)\b', re.IGNORECASE),
     re.compile(r'пени\s+(\d+(?:[.,]\d{2})?)', re.IGNORECASE),
 ]
 
@@ -147,14 +138,21 @@ def extract_case_info(text: str) -> Dict:
     if not header.strip():
         return case_info
 
+    # 1. Номер дела: ищем после даты или ключевых слов
     cn_match = re.search(r'(?:Дело|производство|дело|производство)\s*№?\s*([A-Za-zА-Яа-я0-9\-/\.\s]+?)(?=\n|$)', header, re.IGNORECASE)
     if cn_match:
         case_info['case_number'] = cn_match.group(1).strip()
     else:
-        cn_match2 = re.search(r'№\s*(\d+[-/\s\d]+)', header)
+        # Фолбэк: ищем цифры после даты в формате "22 марта 2022 59 12022"
+        cn_match2 = re.search(r'\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\s+([0-9\-/\s]+?)(?=\n|$)', header, re.IGNORECASE)
         if cn_match2:
             case_info['case_number'] = cn_match2.group(1).strip()
+        else:
+            cn_match3 = re.search(r'№\s*(\d+[-/\s\d]+)', header)
+            if cn_match3:
+                case_info['case_number'] = cn_match3.group(1).strip()
 
+    # 2. Дата дела
     date_match = re.search(r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})', header, re.IGNORECASE)
     if date_match:
         case_info['case_date'] = date_match.group(1)
@@ -163,20 +161,24 @@ def extract_case_info(text: str) -> Dict:
         if date_match2:
             case_info['case_date'] = date_match2.group(1)
 
+    # 3. Наименование суда
     lines = header.strip().split('\n')
     court_lines = [line.strip() for line in lines[:5] if line.strip() and len(line.strip()) > 10 and not re.search(r'\d{6}', line)]
     if court_lines:
         case_info['court_name'] = ' '.join(court_lines).strip()
 
+    # 4. Адрес суда
     addr_match = re.search(r'(\d{6},\s*.*?(?:ул\.|улица|г\.|город|пр\.|проспект).*?)(?=\n\n|Именем|сайт|e-mail|@|$)', header, re.IGNORECASE | re.DOTALL)
     if addr_match:
         case_info['court_address'] = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
 
+    # 5. ФИО судьи (добавлен паттерн для полного имени перед "рассмотрев")
     judge_patterns = [
         r'Мировой судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
         r'Мировой судья\s+([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Яа-яA-Za-z]+)',
         r'судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
-        r'([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)[\s,]*рассмотрев',
+        r'([А-Яа-яA-Za-z]+\s+[А-Яа-яA-Za-z]+\s+[А-Яа-яA-Za-z]+)[\s,]*рассмотрев', # Полное имя
+        r'([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)[\s,]*рассмотрев', # Инициалы
     ]
     for pattern in judge_patterns:
         judge_match = re.search(pattern, header)
@@ -214,13 +216,16 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
         if hasattr(match.fact, 'currency') and match.fact.currency:
             add_entity(text[match.start:match.stop], f"MONEY_{match.fact.currency}", match.start, match.stop, 0.95, currency=match.fact.currency)
 
-    # 1.1 ДЕНЬГИ (Fallback Regex)
+    # 1.1 ДЕНЬГИ (Fallback Regex с поддержкой py6)
     for pattern in MONEY_FALLBACKS:
         for match in pattern.finditer(text):
             if pattern.pattern.startswith('пени'):
                 text_match, start, end = match.group(1), match.start(1), match.end(1)
             else:
                 text_match, start, end = match.group(0), match.start(), match.end()
+
+            # Очищаем от переносов строк внутри суммы
+            text_match = re.sub(r'\s+', ' ', text_match).strip()
 
             overlap = any(e.start_pos <= start < e.end_pos for e in entities if e.type.startswith('MONEY'))
             if not overlap:
@@ -242,18 +247,15 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
     # 4. СЛОВАРЬ (YARGY + SMART FILTER)
-    # Сортируем фразы по длине (desc), чтобы длинные проверялись первыми и блокировали короткие
     sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
-
     for match in DICT_PARSER.findall(text):
         matched_text = text[match.span.start:match.span.stop]
-
         for clean_phrase in sorted_phrases:
             if is_valid_dict_match(matched_text, clean_phrase):
                 category = phrase_to_category[clean_phrase]
                 normal_form = normalize_matched_text(matched_text)
                 add_entity(matched_text, category, match.span.start, match.span.stop, 0.9, normal_form=normal_form)
-                break # Переходим к следующему совпадению, чтобы не дублировать категории
+                break
 
     # 5. КАСТОМНЫЕ РЕКВИЗИТЫ
     for entity_type, pattern in CUSTOM_PATTERNS.items():
