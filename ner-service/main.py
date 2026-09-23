@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v23: Универсальный генератор regex из dictionary.json (вместо хардкода SUBJECT_FALLBACKS)
+FINAL PRODUCTION v24: Безопасный универсальный regex (без \w* для коротких слов), фикс судьи и адреса
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -44,7 +44,7 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. YARGY + SMART FILTER (Для фраз без переносов строк)
+# 2. YARGY + SMART FILTER (Для морфологии)
 # ==========================================
 phrase_to_category = {}
 all_phrases = []
@@ -83,14 +83,15 @@ def normalize_matched_text(matched_text: str) -> str:
     return " ".join(norm_words) if norm_words else matched_text
 
 # ==========================================
-# 3. УНИВЕРСАЛЬНЫЙ ГЕНЕРАТОР REGEX ИЗ СЛОВАРЯ
+# 3. БЕЗОПАСНЫЙ УНИВЕРСАЛЬНЫЙ ГЕНЕРАТОР REGEX
 # ==========================================
 UNIVERSAL_SUBJECT_REGEXES = []
 
 def build_universal_regexes(dict_data: dict) -> list:
     """
-    Автоматически создает OCR-устойчивые регулярные выражения
-    для КАЖДОЙ фразы в словаре. Разрешает переносы строк и любые окончания.
+    Создает строгие регулярные выражения для фраз из словаря.
+    Использует \s+ для разрешения переносов строк, но НЕ добавляет \w*,
+    чтобы "пери" не матчило "период".
     """
     patterns = []
     for category, phrases in dict_data.items():
@@ -99,26 +100,19 @@ def build_universal_regexes(dict_data: dict) -> list:
             if not words:
                 continue
 
-            regex_parts = []
-            for w in words:
-                clean_w = re.sub(r'[^\w]', '', w)
-                if clean_w:
-                    # \w* позволяет ловить любые окончания (расход, расходы, расходов)
-                    regex_parts.append(clean_w + r'\w*')
+            # re.escape гарантирует точное совпадение слов, \s+ разрешает \n между ними
+            regex_parts = [re.escape(w) for w in words]
+            pattern_str = r'\b' + r'\s+'.join(regex_parts) + r'\b'
 
-            if regex_parts:
-                # \s+ разрешает пробелы, табы И переносы строк (\n) между словами
-                pattern_str = r'\b' + r'\s+'.join(regex_parts) + r'\b'
-                try:
-                    compiled = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
-                    patterns.append((compiled, category, phrase))
-                except re.error:
-                    pass # Пропускаем некорректные регулянки
+            try:
+                compiled = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
+                patterns.append((compiled, category, phrase))
+            except re.error:
+                pass
 
-    # Сортируем по длине фразы (desc), чтобы самые длинные и специфичные матчились первыми
+    # Сортируем по длине фразы (desc), чтобы самые длинные матчились первыми
     return sorted(patterns, key=lambda x: len(x[2]), reverse=True)
 
-# Генерируем универсальные паттерны при старте
 UNIVERSAL_SUBJECT_REGEXES = build_universal_regexes(dictionary)
 
 # ==========================================
@@ -134,7 +128,6 @@ CUSTOM_PATTERNS = {
     'CONTRACT_NUMBER': re.compile(r'(?:договор|соглашение)\s+(?:№\s*)?([A-Za-zА-Яа-я0-9\-/\.]+)', re.IGNORECASE),
 }
 
-# ФИКС: Корректно ловит "242 637,21\nруб.", "57 329 руб. 92 коп.", "727,36 руб."
 MONEY_FALLBACKS = [
     re.compile(r'(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)\s+((?:руб\.?(?:\s*\d{1,2})?)|рублей|(?:коп\.?(?:\s*\d{1,2})?)|копеек|(?:py6\.?(?:\s*\d{1,2})?))', re.IGNORECASE),
     re.compile(r'пени\s+(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)', re.IGNORECASE),
@@ -202,26 +195,28 @@ def extract_case_info(text: str) -> Dict:
     if court_lines:
         case_info['court_name'] = ' '.join(court_lines).strip()
 
-    # ФИКС: Адрес может быть в формате "ул. ..., д. ..., г. ..., 123456" (индекс в конце)
-    addr_match = re.search(r'((?:ул\.|улица|г\.|город|пр\.|проспект|д\.|дом)[^,\n]*?(?:,\s*\d{6}|\d{6}))', header, re.IGNORECASE)
+    # ФИКС: Надежный захват адреса с индексом в конце или начале строки
+    addr_match = re.search(r'((?:ул\.|улица|г\.|гор\.|город|пр\.|проспект|д\.|дом|обл\.|область).*?\d{6})', header, re.IGNORECASE | re.DOTALL)
     if addr_match:
         case_info['court_address'] = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
-    else:
-        # Фолбэк: индекс в начале
-        addr_match2 = re.search(r'(\d{6},\s*.*?(?:ул\.|улица|г\.|город|пр\.|проспект).*?)(?=\n\n|Именем|сайт|e-mail|@|должнику|взыскателя|РЕШИЛ:|$)', header, re.IGNORECASE | re.DOTALL)
-        if addr_match2:
-            case_info['court_address'] = re.sub(r'\s+', ' ', addr_match2.group(1)).strip()
 
-    # ФИКС: Строгий паттерн для имени судьи. Третье слово (фамилия) ОБЯЗАТЕЛЬНО начинается с большой буквы ([А-Я]).
+    # ФИКС: Поиск судьи в шапке
     judge_patterns = [
-        r'([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Я][а-яA-Za-z]+)', # И.О. Фамилия (наивысший приоритет)
-        r'Мировой\s+судья\s+(?:участка\s+\d+\s+.*?)?([А-Я][а-я]+)(?:\s+рассмотрев|\n|$)', # Фамилия после "Мировой судья"
+        r'([А-Я]\.\s*[А-Я]\.\s*[А-Я][а-я]+)', # И.О. Фамилия
+        r'Мировой\s+судья.*?([А-Я][а-я]{2,})\s+(?:рассмотрев|подписал|вынес)', # Фамилия перед действием
+        r'судья\s+([А-Я][а-я]+\s+[А-Я]\.\s*[А-Я]\.)', # Фамилия И.О.
     ]
     for pattern in judge_patterns:
         judge_match = re.search(pattern, header)
         if judge_match:
             case_info['judge_name'] = re.sub(r'\s+', ' ', judge_match.group(1)).strip()
             break
+
+    # ФИКС: Фолбэк - если судья не найден в шапке, ищем подпись в конце всего документа
+    if not case_info['judge_name']:
+        footer_match = re.search(r'([А-Я]\.\s*[А-Я]\.\s*[А-Я][а-я]+)', text)
+        if footer_match:
+            case_info['judge_name'] = re.sub(r'\s+', ' ', footer_match.group(1)).strip()
 
     return case_info
 
@@ -252,7 +247,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
-    # А. ГЛОБАЛЬНЫЙ ПОИСК (Имена, Даты, Реквизиты)
+    # А. ГЛОБАЛЬНЫЙ ПОИСК
     for match in names_extractor(text):
         word = text[match.start:match.stop]
         if len(word.split()) >= 2:
@@ -277,15 +272,12 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             else:
                 add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
 
-    # Б. ЛОКАЛЬНЫЙ ПОИСК (РЕЗОЛЮЦИЯ: SUBJECT и MONEY)
-
-    # 1. Деньги (Natasha)
+    # Б. ЛОКАЛЬНЫЙ ПОИСК (РЕЗОЛЮЦИЯ)
     for match in money_extractor(resolution_text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
             add_entity(resolution_text[match.start:match.stop], f"MONEY_{match.fact.currency}",
                        match.start + resolution_start, match.stop + resolution_start, 0.95, currency=match.fact.currency)
 
-    # 2. Деньги (Fallback Regex с поддержкой py6 и переносов строк)
     for pattern in MONEY_FALLBACKS:
         for match in pattern.finditer(resolution_text):
             text_match = match.group(0)
@@ -299,7 +291,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             if not overlap:
                 add_entity(text_match, 'MONEY_RUB', real_start, real_end, 0.90, currency='RUB', normal_form=text_match)
 
-    # 3. SUBJECT через Yargy (для фраз без переносов строк)
+    # 1. SUBJECT через Yargy (морфология)
     sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
     for match in DICT_PARSER.findall(resolution_text):
         matched_text = resolution_text[match.span.start:match.span.stop]
@@ -310,19 +302,17 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 add_entity(matched_text, category, match.span.start + resolution_start, match.span.stop + resolution_start, 0.9, normal_form=normal_form)
                 break
 
-    # 4. УНИВЕРСАЛЬНЫЙ ПОИСК SUBJECT (учитывает \n и любые окончания из dictionary.json)
+    # 2. УНИВЕРСАЛЬНЫЙ ПОИСК SUBJECT (строгие фразы из словаря с поддержкой \n)
     for pattern, category, original_phrase in UNIVERSAL_SUBJECT_REGEXES:
         for match in pattern.finditer(resolution_text):
             matched_text = match.group(0).strip()
-            clean_matched = re.sub(r'\s+', ' ', matched_text) # Убираем \n для чистоты
+            clean_matched = re.sub(r'\s+', ' ', matched_text)
 
             real_start = match.start() + resolution_start
             real_end = match.end() + resolution_start
 
-            # Проверяем, не перекрыто ли это уже найденным через Yargy
             overlap = any(e.start_pos <= real_start < e.end_pos or real_start < e.end_pos <= real_end for e in entities if e.type == 'SUBJECT')
             if not overlap:
-                # Используем оригинальную фразу из словаря как нормальную форму
                 add_entity(clean_matched, category, real_start, real_end, 0.9, normal_form=original_phrase)
 
     # В. ДЕДУПЛИКАЦИЯ
