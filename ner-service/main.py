@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v11: Bounded Gap Regex (значимые слова обязательны, разрыв <= 35 символов)
+FINAL PRODUCTION v12: Yargy morph_pipeline + Smart Length/Overlap Filter (Железобетонная стабильность)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -11,6 +11,9 @@ from pathlib import Path
 import pymorphy3
 
 from natasha import MorphVocab, MoneyExtractor, DatesExtractor, NamesExtractor
+from yargy import Parser
+from yargy.pipelines import morph_pipeline
+from yargy.interpretation import fact
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
@@ -42,55 +45,41 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. BOUNDED GAP REGEX ДЛЯ СЛОВАРЯ
+# 2. YARGY + SMART FILTER ДЛЯ СЛОВАРЯ
 # ==========================================
-COMPILED_DICT_REGEXES = []
+phrase_to_category = {}
+all_phrases = []
 
-def build_bounded_gap_regex(phrase: str) -> Optional[re.Pattern]:
-    """
-    Строит regex, требующий наличия ВСЕХ значимых слов фразы в правильном порядке,
-    но допускающий разрыв до 35 символов между ними (покрывает пропущенные предлоги и опечатки OCR).
-    Это предотвращает совпадение отдельных слов (например, "период" не совпадет с "задолженность за период",
-    если они далеко друг от друга).
-    """
-    words = phrase.split()
-    significant_parts = []
-
-    for w in words:
-        clean_w = re.sub(r'[^\w\s]', '', w)
-        if not clean_w:
-            continue
-        p = morph.parse(clean_w)[0]
-
-        # Берем только значимые части речи
-        if 'PREP' in p.tag.grammemes or 'CONJ' in p.tag.grammemes or 'PRCL' in p.tag.grammemes:
-            continue
-
-        lemma = p.normal_form.lower()
-        # Хак для OCR: неустойка -> н[её]?устойка
-        lemma = re.sub(r'^н([её])', r'н[её]?', lemma)
-
-        # Разрешаем стандартные окончания
-        lemma_regex = lemma + r'\w*'
-        significant_parts.append(lemma_regex)
-
-    # Если значимых слов меньше 2, фраза слишком короткая/общая, пропускаем её,
-    # чтобы избежать ложных срабатываний на отдельные слова (например, "по кредиту" -> "кредит")
-    if len(significant_parts) < 2:
-        return None
-
-    # Соединяем значимые слова, допуская разрыв до 35 любых символов между ними
-    gap = r'.{0,35}?'
-    pattern_str = r'\b' + gap.join(significant_parts) + r'\b'
-
-    return re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
-
-# Компилируем все фразы из словаря
 for category, phrases in dictionary.items():
     for phrase in phrases:
-        regex = build_bounded_gap_regex(phrase)
-        if regex:
-            COMPILED_DICT_REGEXES.append((regex, category, phrase))
+        # Очищаем фразу от лишней пунктуации для yargy
+        clean_phrase = " ".join([w.strip(".,;:-") for w in phrase.split()])
+        all_phrases.append(clean_phrase)
+        phrase_to_category[clean_phrase.lower()] = category
+
+DictEntity = fact('DictEntity', ['text'])
+DICT_RULE = morph_pipeline(all_phrases).interpretation(DictEntity.text.normalized())
+DICT_PARSER = Parser(DICT_RULE)
+
+def is_valid_dict_match(matched_text: str, clean_phrase: str) -> bool:
+    """Проверяет, что yargy не выцепил случайное короткое слово"""
+    # 1. Проверка длины: найденный текст должен быть не менее 65% от длины фразы в словаре
+    if len(matched_text) < len(clean_phrase) * 0.65:
+        return False
+
+    # 2. Проверка пересечения слов: должно быть минимум 2 общих слова
+    matched_words = set(re.findall(r'\w+', matched_text.lower()))
+    phrase_words = set(re.findall(r'\w+', clean_phrase.lower()))
+
+    # Фильтруем предлоги для более точного подсчета значимых слов
+    stop_words = {'в', 'на', 'по', 'за', 'с', 'к', 'у', 'о', 'об', 'от', 'до', 'из', 'под', 'над', 'и', 'а', 'но', 'или'}
+    matched_sig = matched_words - stop_words
+    phrase_sig = phrase_words - stop_words
+
+    if len(matched_sig & phrase_sig) >= 2:
+        return True
+
+    return False
 
 # ==========================================
 # 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ
@@ -240,16 +229,18 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 if not any(char.isascii() and char.isalpha() for char in word):
                     add_entity(word, 'NAME', match.start, match.stop, 0.95)
 
-    # 4. СЛОВАРЬ (BOUNDED GAP)
-    # Сортируем по длине оригинальной фразы (desc), чтобы длинные фразы блокировали короткие
-    sorted_dict_regexes = sorted(COMPILED_DICT_REGEXES, key=lambda x: len(x[2]), reverse=True)
+    # 4. СЛОВАРЬ (YARGY + SMART FILTER)
+    for match in DICT_PARSER.findall(text):
+        matched_text = text[match.span.start:match.span.stop]
 
-    for regex, category, original_phrase in sorted_dict_regexes:
-        for match in regex.finditer(text):
-            matched_text = match.group(0).strip()
-            overlap = any(e.start_pos <= match.start() < e.end_pos or e.start_pos < match.end() <= e.end_pos for e in entities)
-            if not overlap and len(matched_text) > 2:
-                add_entity(matched_text, category, match.start(), match.end(), 0.9, normal_form=original_phrase)
+        # Ищем, какой фразе из словаря это соответствует
+        for clean_phrase, category in phrase_to_category.items():
+            if is_valid_dict_match(matched_text, clean_phrase):
+                add_entity(
+                    matched_text, category, match.span.start, match.span.stop, 0.9,
+                    normal_form=clean_phrase # Сохраняем оригинальную фразу из словаря как нормальную форму
+                )
+                break # Переходим к следующему совпадению, чтобы не дублировать категории
 
     # 5. КАСТОМНЫЕ РЕКВИЗИТЫ
     for entity_type, pattern in CUSTOM_PATTERNS.items():
