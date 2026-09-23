@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v21: Фикс денег с переносом строки (242 637,21\nруб.), чистка judge_name и court_address
+FINAL PRODUCTION v23: Универсальный генератор regex из dictionary.json (вместо хардкода SUBJECT_FALLBACKS)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -44,7 +44,7 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. YARGY + SMART FILTER
+# 2. YARGY + SMART FILTER (Для фраз без переносов строк)
 # ==========================================
 phrase_to_category = {}
 all_phrases = []
@@ -83,7 +83,46 @@ def normalize_matched_text(matched_text: str) -> str:
     return " ".join(norm_words) if norm_words else matched_text
 
 # ==========================================
-# 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ (С ФИКСАМИ)
+# 3. УНИВЕРСАЛЬНЫЙ ГЕНЕРАТОР REGEX ИЗ СЛОВАРЯ
+# ==========================================
+UNIVERSAL_SUBJECT_REGEXES = []
+
+def build_universal_regexes(dict_data: dict) -> list:
+    """
+    Автоматически создает OCR-устойчивые регулярные выражения
+    для КАЖДОЙ фразы в словаре. Разрешает переносы строк и любые окончания.
+    """
+    patterns = []
+    for category, phrases in dict_data.items():
+        for phrase in phrases:
+            words = [w.strip(".,;:-") for w in phrase.split()]
+            if not words:
+                continue
+
+            regex_parts = []
+            for w in words:
+                clean_w = re.sub(r'[^\w]', '', w)
+                if clean_w:
+                    # \w* позволяет ловить любые окончания (расход, расходы, расходов)
+                    regex_parts.append(clean_w + r'\w*')
+
+            if regex_parts:
+                # \s+ разрешает пробелы, табы И переносы строк (\n) между словами
+                pattern_str = r'\b' + r'\s+'.join(regex_parts) + r'\b'
+                try:
+                    compiled = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
+                    patterns.append((compiled, category, phrase))
+                except re.error:
+                    pass # Пропускаем некорректные регулянки
+
+    # Сортируем по длине фразы (desc), чтобы самые длинные и специфичные матчились первыми
+    return sorted(patterns, key=lambda x: len(x[2]), reverse=True)
+
+# Генерируем универсальные паттерны при старте
+UNIVERSAL_SUBJECT_REGEXES = build_universal_regexes(dictionary)
+
+# ==========================================
+# 4. ОСТАЛЬНЫЕ ПАТТЕРНЫ
 # ==========================================
 CUSTOM_PATTERNS = {
     'INN': re.compile(r'\bИНН\s*(\d{10}|\d{12})\b'),
@@ -101,14 +140,8 @@ MONEY_FALLBACKS = [
     re.compile(r'пени\s+(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)', re.IGNORECASE),
 ]
 
-SUBJECT_FALLBACKS = [
-    (re.compile(r'задолженност\w*\s+по\s+кредит\w*\s+договор\w*', re.IGNORECASE | re.DOTALL), "задолженность кредитный договор"),
-    (re.compile(r'задолженност\w*\s+по\s+уплат\w*\s+процент\w*', re.IGNORECASE | re.DOTALL), "задолженность уплата процент"),
-    (re.compile(r'расход\w*\s+по\s+оплат\w*\s+(?:государствен\w*\s+)?пошлин\w*', re.IGNORECASE | re.DOTALL), "расход оплата государственная пошлина"),
-]
-
 # ==========================================
-# 4. МОДЕЛИ ДАННЫХ
+# 5. МОДЕЛИ ДАННЫХ
 # ==========================================
 class Entity(BaseModel):
     text: str
@@ -134,7 +167,7 @@ class NERResponse(BaseModel):
     case_info: Optional[Dict] = None
 
 # ==========================================
-# 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 6. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 def extract_case_info(text: str) -> Dict:
     header_match = re.search(r'^(.*?)(?:РЕШИЛ:|ПОСТАНОВИЛ:|ОПРЕДЕЛИЛ:|ПРИКАЗЫВАЮ:)', text, re.IGNORECASE | re.DOTALL)
@@ -169,16 +202,20 @@ def extract_case_info(text: str) -> Dict:
     if court_lines:
         case_info['court_name'] = ' '.join(court_lines).strip()
 
-    # ФИКС: Добавлены стоп-слова должнику, взыскателя, РЕШИЛ: чтобы не захватывать лишний текст
-    addr_match = re.search(r'(\d{6},\s*.*?(?:ул\.|улица|г\.|город|пр\.|проспект).*?)(?=\n\n|Именем|сайт|e-mail|@|должнику|взыскателя|РЕШИЛ:|$)', header, re.IGNORECASE | re.DOTALL)
+    # ФИКС: Адрес может быть в формате "ул. ..., д. ..., г. ..., 123456" (индекс в конце)
+    addr_match = re.search(r'((?:ул\.|улица|г\.|город|пр\.|проспект|д\.|дом)[^,\n]*?(?:,\s*\d{6}|\d{6}))', header, re.IGNORECASE)
     if addr_match:
         case_info['court_address'] = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
+    else:
+        # Фолбэк: индекс в начале
+        addr_match2 = re.search(r'(\d{6},\s*.*?(?:ул\.|улица|г\.|город|пр\.|проспект).*?)(?=\n\n|Именем|сайт|e-mail|@|должнику|взыскателя|РЕШИЛ:|$)', header, re.IGNORECASE | re.DOTALL)
+        if addr_match2:
+            case_info['court_address'] = re.sub(r'\s+', ' ', addr_match2.group(1)).strip()
 
-    # ФИКС: Паттерн с инициалами (И.О. Фамилия) стоит ПЕРВЫМ, чтобы перехватить чистую подпись в конце
+    # ФИКС: Строгий паттерн для имени судьи. Третье слово (фамилия) ОБЯЗАТЕЛЬНО начинается с большой буквы ([А-Я]).
     judge_patterns = [
-        r'([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Яа-яA-Za-z]+)', # И.О. Фамилия (наивысший приоритет)
-        r'Мировой судья\s+(?:.*?\s+)?([А-Я][а-я]+)(?:\s+рассмотрев|\n|$)', # Фамилия после "Мировой судья"
-        r'судья\s+([А-Яа-яA-Za-z]+\s+[А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.?)',
+        r'([А-ЯA-Za-z]\.\s*[А-ЯA-Za-z]\.\s*[А-Я][а-яA-Za-z]+)', # И.О. Фамилия (наивысший приоритет)
+        r'Мировой\s+судья\s+(?:участка\s+\d+\s+.*?)?([А-Я][а-я]+)(?:\s+рассмотрев|\n|$)', # Фамилия после "Мировой судья"
     ]
     for pattern in judge_patterns:
         judge_match = re.search(pattern, header)
@@ -197,7 +234,7 @@ def is_address_context(text: str, start_pos: int) -> bool:
     return False
 
 # ==========================================
-# 6. ЛОГИКА ИЗВЛЕЧЕНИЯ
+# 7. ЛОГИКА ИЗВЛЕЧЕНИЯ
 # ==========================================
 def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     entities = []
@@ -215,7 +252,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             currency=currency, start_pos=start, end_pos=end, confidence=conf
         ))
 
-    # А. ГЛОБАЛЬНЫЙ ПОИСК
+    # А. ГЛОБАЛЬНЫЙ ПОИСК (Имена, Даты, Реквизиты)
     for match in names_extractor(text):
         word = text[match.start:match.stop]
         if len(word.split()) >= 2:
@@ -240,15 +277,17 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             else:
                 add_entity(match.group(1), entity_type, match.start(), match.end(), 0.95, normal_form=match.group(1))
 
-    # Б. ЛОКАЛЬНЫЙ ПОИСК (РЕЗОЛЮЦИЯ)
+    # Б. ЛОКАЛЬНЫЙ ПОИСК (РЕЗОЛЮЦИЯ: SUBJECT и MONEY)
+
+    # 1. Деньги (Natasha)
     for match in money_extractor(resolution_text):
         if hasattr(match.fact, 'currency') and match.fact.currency:
             add_entity(resolution_text[match.start:match.stop], f"MONEY_{match.fact.currency}",
                        match.start + resolution_start, match.stop + resolution_start, 0.95, currency=match.fact.currency)
 
+    # 2. Деньги (Fallback Regex с поддержкой py6 и переносов строк)
     for pattern in MONEY_FALLBACKS:
         for match in pattern.finditer(resolution_text):
-            # Группа 0 - это всё совпадение целиком (например, "242 637,21\nруб.")
             text_match = match.group(0)
             start, end = match.start(), match.end()
 
@@ -260,6 +299,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             if not overlap:
                 add_entity(text_match, 'MONEY_RUB', real_start, real_end, 0.90, currency='RUB', normal_form=text_match)
 
+    # 3. SUBJECT через Yargy (для фраз без переносов строк)
     sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
     for match in DICT_PARSER.findall(resolution_text):
         matched_text = resolution_text[match.span.start:match.span.stop]
@@ -270,16 +310,20 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 add_entity(matched_text, category, match.span.start + resolution_start, match.span.stop + resolution_start, 0.9, normal_form=normal_form)
                 break
 
-    for pattern, normal_form in SUBJECT_FALLBACKS:
+    # 4. УНИВЕРСАЛЬНЫЙ ПОИСК SUBJECT (учитывает \n и любые окончания из dictionary.json)
+    for pattern, category, original_phrase in UNIVERSAL_SUBJECT_REGEXES:
         for match in pattern.finditer(resolution_text):
             matched_text = match.group(0).strip()
-            clean_matched = re.sub(r'\s+', ' ', matched_text)
+            clean_matched = re.sub(r'\s+', ' ', matched_text) # Убираем \n для чистоты
+
             real_start = match.start() + resolution_start
             real_end = match.end() + resolution_start
 
+            # Проверяем, не перекрыто ли это уже найденным через Yargy
             overlap = any(e.start_pos <= real_start < e.end_pos or real_start < e.end_pos <= real_end for e in entities if e.type == 'SUBJECT')
             if not overlap:
-                add_entity(clean_matched, 'SUBJECT', real_start, real_end, 0.9, normal_form=normal_form)
+                # Используем оригинальную фразу из словаря как нормальную форму
+                add_entity(clean_matched, category, real_start, real_end, 0.9, normal_form=original_phrase)
 
     # В. ДЕДУПЛИКАЦИЯ
     unique_entities = []
@@ -348,7 +392,7 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
     return final_pairs
 
 # ==========================================
-# 7. API ENDPOINTS
+# 8. API ENDPOINTS
 # ==========================================
 @app.get("/")
 def read_root():
