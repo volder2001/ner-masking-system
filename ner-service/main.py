@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v24: Безопасный универсальный regex (без \w* для коротких слов), фикс судьи и адреса
+FINAL PRODUCTION v27: Гибридный алгоритм связывания (строгий + дистанционный фолбэк)
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -44,7 +44,7 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. YARGY + SMART FILTER (Для морфологии)
+# 2. YARGY + SMART FILTER
 # ==========================================
 phrase_to_category = {}
 all_phrases = []
@@ -83,26 +83,21 @@ def normalize_matched_text(matched_text: str) -> str:
     return " ".join(norm_words) if norm_words else matched_text
 
 # ==========================================
-# 3. БЕЗОПАСНЫЙ УНИВЕРСАЛЬНЫЙ ГЕНЕРАТОР REGEX
+# 3. УНИВЕРСАЛЬНЫЙ ГЕНЕРАТОР REGEX (С \W+)
 # ==========================================
 UNIVERSAL_SUBJECT_REGEXES = []
 
 def build_universal_regexes(dict_data: dict) -> list:
-    """
-    Создает строгие регулярные выражения для фраз из словаря.
-    Использует \s+ для разрешения переносов строк, но НЕ добавляет \w*,
-    чтобы "пери" не матчило "период".
-    """
     patterns = []
     for category, phrases in dict_data.items():
         for phrase in phrases:
-            words = [w.strip(".,;:-") for w in phrase.split()]
+            words = [re.sub(r'[^\w]', '', w) for w in phrase.split()]
+            words = [w for w in words if w]
             if not words:
                 continue
 
-            # re.escape гарантирует точное совпадение слов, \s+ разрешает \n между ними
-            regex_parts = [re.escape(w) for w in words]
-            pattern_str = r'\b' + r'\s+'.join(regex_parts) + r'\b'
+            regex_parts = [w + r'\w*' for w in words]
+            pattern_str = r'\b' + r'\W+'.join(regex_parts) + r'\b'
 
             try:
                 compiled = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
@@ -110,7 +105,6 @@ def build_universal_regexes(dict_data: dict) -> list:
             except re.error:
                 pass
 
-    # Сортируем по длине фразы (desc), чтобы самые длинные матчились первыми
     return sorted(patterns, key=lambda x: len(x[2]), reverse=True)
 
 UNIVERSAL_SUBJECT_REGEXES = build_universal_regexes(dictionary)
@@ -129,7 +123,7 @@ CUSTOM_PATTERNS = {
 }
 
 MONEY_FALLBACKS = [
-    re.compile(r'(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)\s+((?:руб\.?(?:\s*\d{1,2})?)|рублей|(?:коп\.?(?:\s*\d{1,2})?)|копеек|(?:py6\.?(?:\s*\d{1,2})?))', re.IGNORECASE),
+    re.compile(r'(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)\s+((?:руб\.?(?:\s*\d{1,2})?)|рублей|(?:коп\.?(?:\s*\d{1,2})?)|копеек|(?:py6\.?(?:\s*\d{1,2})?)|(?:kon\.?(?:\s*\d{1,2})?))', re.IGNORECASE),
     re.compile(r'пени\s+(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)', re.IGNORECASE),
 ]
 
@@ -195,16 +189,14 @@ def extract_case_info(text: str) -> Dict:
     if court_lines:
         case_info['court_name'] = ' '.join(court_lines).strip()
 
-    # ФИКС: Надежный захват адреса с индексом в конце или начале строки
     addr_match = re.search(r'((?:ул\.|улица|г\.|гор\.|город|пр\.|проспект|д\.|дом|обл\.|область).*?\d{6})', header, re.IGNORECASE | re.DOTALL)
     if addr_match:
         case_info['court_address'] = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
 
-    # ФИКС: Поиск судьи в шапке
     judge_patterns = [
-        r'([А-Я]\.\s*[А-Я]\.\s*[А-Я][а-я]+)', # И.О. Фамилия
-        r'Мировой\s+судья.*?([А-Я][а-я]{2,})\s+(?:рассмотрев|подписал|вынес)', # Фамилия перед действием
-        r'судья\s+([А-Я][а-я]+\s+[А-Я]\.\s*[А-Я]\.)', # Фамилия И.О.
+        r'([А-Я]\.\s*[А-Я]\.\s*[А-Я][а-я]+)',
+        r'Мировой\s+судья.*?([А-Я][а-я]{2,})\s+(?:рассмотрев|подписал|вынес)',
+        r'судья\s+([А-Я][а-я]+\s+[А-Я]\.\s*[А-Я]\.)',
     ]
     for pattern in judge_patterns:
         judge_match = re.search(pattern, header)
@@ -212,7 +204,6 @@ def extract_case_info(text: str) -> Dict:
             case_info['judge_name'] = re.sub(r'\s+', ' ', judge_match.group(1)).strip()
             break
 
-    # ФИКС: Фолбэк - если судья не найден в шапке, ищем подпись в конце всего документа
     if not case_info['judge_name']:
         footer_match = re.search(r'([А-Я]\.\s*[А-Я]\.\s*[А-Я][а-я]+)', text)
         if footer_match:
@@ -291,7 +282,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             if not overlap:
                 add_entity(text_match, 'MONEY_RUB', real_start, real_end, 0.90, currency='RUB', normal_form=text_match)
 
-    # 1. SUBJECT через Yargy (морфология)
+    # 1. SUBJECT через Yargy
     sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
     for match in DICT_PARSER.findall(resolution_text):
         matched_text = resolution_text[match.span.start:match.span.stop]
@@ -302,7 +293,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
                 add_entity(matched_text, category, match.span.start + resolution_start, match.span.stop + resolution_start, 0.9, normal_form=normal_form)
                 break
 
-    # 2. УНИВЕРСАЛЬНЫЙ ПОИСК SUBJECT (строгие фразы из словаря с поддержкой \n)
+    # 2. УНИВЕРСАЛЬНЫЙ ПОИСК SUBJECT
     for pattern, category, original_phrase in UNIVERSAL_SUBJECT_REGEXES:
         for match in pattern.finditer(resolution_text):
             matched_text = match.group(0).strip()
@@ -311,7 +302,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             real_start = match.start() + resolution_start
             real_end = match.end() + resolution_start
 
-            overlap = any(e.start_pos <= real_start < e.end_pos or real_start < e.end_pos <= real_end for e in entities if e.type == 'SUBJECT')
+            overlap = any(e.start_pos <= real_start < e.end_pos or real_start < e.end_pos <= real_end for e in entities if e.type in ['SUBJECT', 'NOT_SUBJECT'])
             if not overlap:
                 add_entity(clean_matched, category, real_start, real_end, 0.9, normal_form=original_phrase)
 
@@ -331,45 +322,64 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 
 
 def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
+    """
+    ГИБРИДНЫЙ АЛГОРИТМ:
+    - Если количество SUBJECT == количеству MONEY → строгий последовательный (твой алгоритм)
+    - Иначе → дистанционный поиск с окном 150 символов (мой алгоритм)
+    """
     subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
 
     subjects.sort(key=lambda x: x.start_pos)
     money_entities.sort(key=lambda x: x.start_pos)
 
+    # ==========================================
+    # РЕЖИМ 1: СТРОГИЙ ПОСЛЕДОВАТЕЛЬНЫЙ (если количество равно)
+    # ==========================================
+    if len(subjects) == len(money_entities) and len(subjects) > 0:
+        final_pairs = []
+        for i, subj in enumerate(subjects):
+            money = money_entities[i]
+            context_start = min(subj.start_pos, money.start_pos)
+            context_end = max(subj.end_pos, money.end_pos) + 40
+            distance = abs(money.start_pos - subj.end_pos)
+
+            final_pairs.append(SubjectMoneyPair(
+                subject=subj,
+                money=money,
+                distance=distance,
+                context=text[context_start:context_end]
+            ))
+        return final_pairs
+
+    # ==========================================
+    # РЕЖИМ 2: ДИСТАНЦИОННЫЙ ПОИСК (если количество не совпадает)
+    # ==========================================
     final_pairs = []
     used_moneys = set()
-
-    WINDOW_FORWARD = 300  # Ищем деньги впереди до 300 символов
-    WINDOW_BACKWARD = 100  # Ищем деньги назад до 100 символов (для MONEY -> SUBJECT)
+    MAX_DISTANCE = 150
 
     for subj in subjects:
         best_money = None
         best_distance = 9999
 
-        # 1. ПРИОРИТЕТ: ищем деньги ВПЕРЕДИ (SUBJECT -> MONEY)
         for money in money_entities:
             if id(money) in used_moneys:
                 continue
-            distance = money.start_pos - subj.end_pos
-            if 0 <= distance <= WINDOW_FORWARD and distance < best_distance:
-                best_money = money
-                best_distance = distance
 
-        # 2. ФОЛБЭК: если впереди нет, ищем НАЗАД (MONEY -> SUBJECT), но в пределах короткого окна
-        if best_money is None:
-            for money in money_entities:
-                if id(money) in used_moneys:
-                    continue
-                distance = subj.start_pos - money.end_pos
-                if 0 <= distance <= WINDOW_BACKWARD and distance < best_distance:
-                    best_money = money
-                    best_distance = distance
+            dist_forward = money.start_pos - subj.end_pos
+            dist_backward = subj.start_pos - money.end_pos
+
+            if 0 <= dist_forward <= MAX_DISTANCE and dist_forward < best_distance:
+                best_money = money
+                best_distance = dist_forward
+            elif 0 <= dist_backward <= MAX_DISTANCE and dist_backward < best_distance:
+                best_money = money
+                best_distance = dist_backward
 
         if best_money is not None:
             used_moneys.add(id(best_money))
 
-            # Контекст берем от начала первой сущности до конца второй + 40 символов
             context_start = min(subj.start_pos, best_money.start_pos)
             context_end = max(subj.end_pos, best_money.end_pos) + 40
 
@@ -380,7 +390,6 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
                 context=text[context_start:context_end]
             ))
         else:
-            # Если денег нет ни впереди, ни в разумных пределах сзади
             final_pairs.append(SubjectMoneyPair(subject=subj, money=None, distance=None, context=None))
 
     return final_pairs
