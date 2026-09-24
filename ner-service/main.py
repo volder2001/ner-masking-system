@@ -1,6 +1,6 @@
 """
 ner-service/main.py
-FINAL PRODUCTION v27: Гибридный алгоритм связывания (строгий + дистанционный фолбэк)
+FINAL PRODUCTION v29: Чистый Yargy morph_pipeline (без ручных костылей морфологии) + Гибридный алгоритм связывания
 """
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -13,6 +13,7 @@ import pymorphy3
 from natasha import MorphVocab, MoneyExtractor, DatesExtractor, NamesExtractor
 from yargy import Parser
 from yargy.pipelines import morph_pipeline
+from yargy.interpretation import fact
 
 app = FastAPI(title="NER Service", version="1.0.0")
 
@@ -44,73 +45,56 @@ def load_dictionary():
 dictionary = load_dictionary()
 
 # ==========================================
-# 2. YARGY + SMART FILTER
+# 2. ЧИСТЫЙ YARGY ДЛЯ СЛОВАРЯ (БЕЗ КОСТЫЛЕЙ)
 # ==========================================
-phrase_to_category = {}
+# Собираем все фразы из словаря в один список для morph_pipeline
 all_phrases = []
+phrase_to_category = {}
 
 for category, phrases in dictionary.items():
     for phrase in phrases:
+        # Очищаем фразу от лишней пунктуации для yargy
         clean_phrase = " ".join([w.strip(".,;:-") for w in phrase.split()])
         all_phrases.append(clean_phrase)
         phrase_to_category[clean_phrase.lower()] = category
 
-DICT_RULE = morph_pipeline(all_phrases)
-DICT_PARSER = Parser(DICT_RULE)
+# morph_pipeline САМ знает все формы слов! "госпошлина" найдет "госпошлину", "госпошлиной" и т.д.
+DICT_PARSER = Parser(morph_pipeline(all_phrases))
 
-STOP_WORDS = {'в', 'на', 'по', 'за', 'с', 'к', 'у', 'о', 'об', 'от', 'до', 'из', 'под', 'над', 'и', 'а', 'но', 'или', 'же', 'бы', 'ли', 'то'}
+def get_category_for_matched_text(matched_text: str) -> Optional[str]:
+    """
+    Определяет категорию (SUBJECT/NOT_SUBJECT) для найденного текста.
+    Поскольку yargy нашел фразу в любой форме, мы лемматизируем найденный текст
+    и сравниваем с лемматизированными фразами из словаря для точного определения категории.
+    """
+    # Лемматизируем найденный текст
+    matched_lemmas = set()
+    for w in re.findall(r'\w+', matched_text.lower()):
+        p = morph.parse(w)[0]
+        if 'PREP' not in p.tag.grammemes and 'CONJ' not in p.tag.grammemes:
+            matched_lemmas.add(p.normal_form)
 
-def is_valid_dict_match(matched_text: str, clean_phrase: str) -> bool:
-    if len(matched_text) < len(clean_phrase) * 0.60:
-        return False
-    matched_words = set(re.findall(r'\w+', matched_text.lower()))
-    phrase_words = set(re.findall(r'\w+', clean_phrase.lower()))
-    matched_sig = matched_words - STOP_WORDS
-    phrase_sig = phrase_words - STOP_WORDS
-    if not phrase_sig:
-        return True
-    overlap_ratio = len(matched_sig & phrase_sig) / len(phrase_sig)
-    return overlap_ratio >= 0.70
+    if not matched_lemmas:
+        return None
 
-def normalize_matched_text(matched_text: str) -> str:
-    norm_words = []
-    for w in matched_text.split():
-        clean_w = re.sub(r'[^\w]', '', w)
-        if clean_w:
-            p = morph.parse(clean_w)[0]
-            if 'PREP' not in p.tag.grammemes and 'CONJ' not in p.tag.grammemes:
-                norm_words.append(p.normal_form)
-    return " ".join(norm_words) if norm_words else matched_text
-
-# ==========================================
-# 3. УНИВЕРСАЛЬНЫЙ ГЕНЕРАТОР REGEX (С \W+)
-# ==========================================
-UNIVERSAL_SUBJECT_REGEXES = []
-
-def build_universal_regexes(dict_data: dict) -> list:
-    patterns = []
-    for category, phrases in dict_data.items():
+    # Ищем совпадение в словаре
+    for category, phrases in dictionary.items():
         for phrase in phrases:
-            words = [re.sub(r'[^\w]', '', w) for w in phrase.split()]
-            words = [w for w in words if w]
-            if not words:
-                continue
+            clean_phrase = " ".join([w.strip(".,;:-") for w in phrase.split()])
+            phrase_lemmas = set()
+            for w in re.findall(r'\w+', clean_phrase.lower()):
+                p = morph.parse(w)[0]
+                if 'PREP' not in p.tag.grammemes and 'CONJ' not in p.tag.grammemes:
+                    phrase_lemmas.add(p.normal_form)
 
-            regex_parts = [w + r'\w*' for w in words]
-            pattern_str = r'\b' + r'\W+'.join(regex_parts) + r'\b'
+            # Если леммы совпадают (или одна содержит другую), это наша категория
+            if matched_lemmas & phrase_lemmas:
+                return category
 
-            try:
-                compiled = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
-                patterns.append((compiled, category, phrase))
-            except re.error:
-                pass
-
-    return sorted(patterns, key=lambda x: len(x[2]), reverse=True)
-
-UNIVERSAL_SUBJECT_REGEXES = build_universal_regexes(dictionary)
+    return None
 
 # ==========================================
-# 4. ОСТАЛЬНЫЕ ПАТТЕРНЫ
+# 3. ОСТАЛЬНЫЕ ПАТТЕРНЫ
 # ==========================================
 CUSTOM_PATTERNS = {
     'INN': re.compile(r'\bИНН\s*(\d{10}|\d{12})\b'),
@@ -123,12 +107,11 @@ CUSTOM_PATTERNS = {
 }
 
 MONEY_FALLBACKS = [
-    re.compile(r'(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)\s+((?:руб\.?(?:\s*\d{1,2})?)|рублей|(?:коп\.?(?:\s*\d{1,2})?)|копеек|(?:py6\.?(?:\s*\d{1,2})?)|(?:kon\.?(?:\s*\d{1,2})?))', re.IGNORECASE),
-    re.compile(r'пени\s+(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)', re.IGNORECASE),
+    re.compile(r'(\d{1,3}(?:\s?\d{3})*(?:[.,]\d{2})?)\s+(?:руб\.?|рублей|коп\.?|копеек|py6\.?|kon\.?)', re.IGNORECASE),
 ]
 
 # ==========================================
-# 5. МОДЕЛИ ДАННЫХ
+# 4. МОДЕЛИ ДАННЫХ
 # ==========================================
 class Entity(BaseModel):
     text: str
@@ -154,7 +137,7 @@ class NERResponse(BaseModel):
     case_info: Optional[Dict] = None
 
 # ==========================================
-# 6. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 def extract_case_info(text: str) -> Dict:
     header_match = re.search(r'^(.*?)(?:РЕШИЛ:|ПОСТАНОВИЛ:|ОПРЕДЕЛИЛ:|ПРИКАЗЫВАЮ:)', text, re.IGNORECASE | re.DOTALL)
@@ -220,7 +203,7 @@ def is_address_context(text: str, start_pos: int) -> bool:
     return False
 
 # ==========================================
-# 7. ЛОГИКА ИЗВЛЕЧЕНИЯ
+# 6. ЛОГИКА ИЗВЛЕЧЕНИЯ
 # ==========================================
 def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     entities = []
@@ -282,29 +265,25 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
             if not overlap:
                 add_entity(text_match, 'MONEY_RUB', real_start, real_end, 0.90, currency='RUB', normal_form=text_match)
 
-    # 1. SUBJECT через Yargy
-    sorted_phrases = sorted(phrase_to_category.keys(), key=len, reverse=True)
+    # 1. SUBJECT / NOT_SUBJECT через ЧИСТЫЙ YARGY
     for match in DICT_PARSER.findall(resolution_text):
         matched_text = resolution_text[match.span.start:match.span.stop]
-        for clean_phrase in sorted_phrases:
-            if is_valid_dict_match(matched_text, clean_phrase):
-                category = phrase_to_category[clean_phrase]
-                normal_form = normalize_matched_text(matched_text)
-                add_entity(matched_text, category, match.span.start + resolution_start, match.span.stop + resolution_start, 0.9, normal_form=normal_form)
-                break
 
-    # 2. УНИВЕРСАЛЬНЫЙ ПОИСК SUBJECT
-    for pattern, category, original_phrase in UNIVERSAL_SUBJECT_REGEXES:
-        for match in pattern.finditer(resolution_text):
-            matched_text = match.group(0).strip()
-            clean_matched = re.sub(r'\s+', ' ', matched_text)
+        # Определяем категорию через лемматизацию (это надежно и использует силу yargy для поиска)
+        category = get_category_for_matched_text(matched_text)
 
-            real_start = match.start() + resolution_start
-            real_end = match.end() + resolution_start
+        if category:
+            # Нормализуем найденный текст для normal_form
+            norm_words = []
+            for w in matched_text.split():
+                clean_w = re.sub(r'[^\w]', '', w)
+                if clean_w:
+                    p = morph.parse(clean_w)[0]
+                    if 'PREP' not in p.tag.grammemes and 'CONJ' not in p.tag.grammemes:
+                        norm_words.append(p.normal_form)
+            normal_form = " ".join(norm_words) if norm_words else matched_text
 
-            overlap = any(e.start_pos <= real_start < e.end_pos or real_start < e.end_pos <= real_end for e in entities if e.type in ['SUBJECT', 'NOT_SUBJECT'])
-            if not overlap:
-                add_entity(clean_matched, category, real_start, real_end, 0.9, normal_form=original_phrase)
+            add_entity(matched_text, category, match.span.start + resolution_start, match.span.stop + resolution_start, 0.9, normal_form=normal_form)
 
     # В. ДЕДУПЛИКАЦИЯ
     unique_entities = []
@@ -322,20 +301,13 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 
 
 def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
-    """
-    ГИБРИДНЫЙ АЛГОРИТМ:
-    - Если количество SUBJECT == количеству MONEY → строгий последовательный (твой алгоритм)
-    - Иначе → дистанционный поиск с окном 150 символов (мой алгоритм)
-    """
     subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
 
     subjects.sort(key=lambda x: x.start_pos)
     money_entities.sort(key=lambda x: x.start_pos)
 
-    # ==========================================
-    # РЕЖИМ 1: СТРОГИЙ ПОСЛЕДОВАТЕЛЬНЫЙ (если количество равно)
-    # ==========================================
+    # ГИБРИДНЫЙ АЛГОРИТМ
     if len(subjects) == len(money_entities) and len(subjects) > 0:
         final_pairs = []
         for i, subj in enumerate(subjects):
@@ -352,9 +324,6 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
             ))
         return final_pairs
 
-    # ==========================================
-    # РЕЖИМ 2: ДИСТАНЦИОННЫЙ ПОИСК (если количество не совпадает)
-    # ==========================================
     final_pairs = []
     used_moneys = set()
     MAX_DISTANCE = 150
@@ -379,7 +348,6 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
 
         if best_money is not None:
             used_moneys.add(id(best_money))
-
             context_start = min(subj.start_pos, best_money.start_pos)
             context_end = max(subj.end_pos, best_money.end_pos) + 40
 
@@ -395,7 +363,7 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
     return final_pairs
 
 # ==========================================
-# 8. API ENDPOINTS
+# 7. API ENDPOINTS
 # ==========================================
 @app.get("/")
 def read_root():
