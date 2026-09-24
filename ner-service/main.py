@@ -147,11 +147,16 @@ def extract_case_info(text: str) -> Dict:
     if not header.strip():
         return case_info
 
-    cn_match = re.search(r'(?:Дело|производство|дело|производство)\s*№?\s*([A-Za-zА-Яа-я0-9\-/\.\s]+?)(?=\n|$)', header, re.IGNORECASE)
+    # 1. Номер дела: добавили "СУДЕБНЫЙ ПРИКАЗ" как триггер
+    cn_match = re.search(
+        r'(?:Дело|производство|дело|производство|СУДЕБНЫЙ ПРИКАЗ)\s*№?\s*([A-Za-zА-Яа-я0-9\-/\.]+?)(?=\n|$)', header,
+        re.IGNORECASE)
     if cn_match:
         case_info['case_number'] = cn_match.group(1).strip()
     else:
-        cn_match2 = re.search(r'\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\s+([0-9\-/\s]+?)(?=\n|$)', header, re.IGNORECASE)
+        cn_match2 = re.search(
+            r'\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\s+([0-9\-/\s]+?)(?=\n|$)',
+            header, re.IGNORECASE)
         if cn_match2:
             case_info['case_number'] = cn_match2.group(1).strip()
         else:
@@ -159,7 +164,10 @@ def extract_case_info(text: str) -> Dict:
             if cn_match3:
                 case_info['case_number'] = cn_match3.group(1).strip()
 
-    date_match = re.search(r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})', header, re.IGNORECASE)
+    # 2. Дата дела
+    date_match = re.search(
+        r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4})',
+        header, re.IGNORECASE)
     if date_match:
         case_info['case_date'] = date_match.group(1)
     else:
@@ -167,15 +175,25 @@ def extract_case_info(text: str) -> Dict:
         if date_match2:
             case_info['case_date'] = date_match2.group(1)
 
+    # 3. Наименование суда
     lines = header.strip().split('\n')
-    court_lines = [line.strip() for line in lines[:5] if line.strip() and len(line.strip()) > 10 and not re.search(r'\d{6}', line)]
+    court_lines = [line.strip() for line in lines[:5] if
+                   line.strip() and len(line.strip()) > 10 and not re.search(r'\d{6}', line)]
     if court_lines:
         case_info['court_name'] = ' '.join(court_lines).strip()
 
-    addr_match = re.search(r'((?:ул\.|улица|г\.|гор\.|город|пр\.|проспект|д\.|дом|обл\.|область).*?\d{6})', header, re.IGNORECASE | re.DOTALL)
+    # 4. Адрес суда: сделали индекс опциональным, так как OCR часто его теряет или ставит в другом месте
+    addr_match = re.search(
+        r'((?:ул\.|улица|г\.|гор\.|город|пр\.|проспект|д\.|дом|обл\.|область).*?)(?=\n\n|ИНН|ОГРН|дата государственной регистрации|РЕШИЛ:|ПРИКАЗЫВАЮ:|$)',
+        header, re.IGNORECASE | re.DOTALL)
     if addr_match:
-        case_info['court_address'] = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
+        # Очищаем адрес от лишних переносов строк и мусора
+        clean_addr = re.sub(r'\s+', ' ', addr_match.group(1)).strip()
+        # Убираем хвосты, если там затесался ИНН или дата
+        clean_addr = re.split(r'(?:ИНН|ОГРН|дата)', clean_addr, flags=re.IGNORECASE)[0].strip()
+        case_info['court_address'] = clean_addr
 
+    # 5. ФИО судьи
     judge_patterns = [
         r'([А-Я]\.\s*[А-Я]\.\s*[А-Я][а-я]+)',
         r'Мировой\s+судья.*?([А-Я][а-я]{2,})\s+(?:рассмотрев|подписал|вынес)',
