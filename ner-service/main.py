@@ -338,37 +338,40 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
     money_entities.sort(key=lambda x: x.start_pos)
 
     final_pairs = []
-    money_idx = 0
-    WINDOW_SIZE = 300
+    used_moneys = set()
+
+    WINDOW_FORWARD = 300  # Ищем деньги впереди до 300 символов
+    WINDOW_BACKWARD = 100  # Ищем деньги назад до 100 символов (для MONEY -> SUBJECT)
 
     for subj in subjects:
         best_money = None
         best_distance = 9999
-        best_money_idx = -1
 
-        for i in range(money_idx, len(money_entities)):
-            money = money_entities[i]
+        # 1. ПРИОРИТЕТ: ищем деньги ВПЕРЕДИ (SUBJECT -> MONEY)
+        for money in money_entities:
+            if id(money) in used_moneys:
+                continue
             distance = money.start_pos - subj.end_pos
-            if distance >= 0 and distance < best_distance:
+            if 0 <= distance <= WINDOW_FORWARD and distance < best_distance:
                 best_money = money
                 best_distance = distance
-                best_money_idx = i
 
+        # 2. ФОЛБЭК: если впереди нет, ищем НАЗАД (MONEY -> SUBJECT), но в пределах короткого окна
         if best_money is None:
-            for i in range(money_idx):
-                money = money_entities[i]
+            for money in money_entities:
+                if id(money) in used_moneys:
+                    continue
                 distance = subj.start_pos - money.end_pos
-                if distance >= 0 and distance < best_distance:
+                if 0 <= distance <= WINDOW_BACKWARD and distance < best_distance:
                     best_money = money
                     best_distance = distance
-                    best_money_idx = i
 
-        if best_money is not None and best_distance <= WINDOW_SIZE:
-            if best_distance >= 0:
-                money_idx = best_money_idx + 1
+        if best_money is not None:
+            used_moneys.add(id(best_money))
 
-            context_start = subj.start_pos
-            context_end = min(best_money.end_pos + 40, len(text))
+            # Контекст берем от начала первой сущности до конца второй + 40 символов
+            context_start = min(subj.start_pos, best_money.start_pos)
+            context_end = max(subj.end_pos, best_money.end_pos) + 40
 
             final_pairs.append(SubjectMoneyPair(
                 subject=subj,
@@ -377,6 +380,7 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
                 context=text[context_start:context_end]
             ))
         else:
+            # Если денег нет ни впереди, ни в разумных пределах сзади
             final_pairs.append(SubjectMoneyPair(subject=subj, money=None, distance=None, context=None))
 
     return final_pairs
