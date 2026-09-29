@@ -2,6 +2,7 @@
 ner-service/main.py
 FINAL PRODUCTION v29: Чистый Yargy morph_pipeline (без ручных костылей морфологии) + Гибридный алгоритм связывания
 """
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Set, Tuple
@@ -21,7 +22,21 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 from fastapi import UploadFile, File
 
+
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os
+
+
 app = FastAPI(title="NER Service", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ==========================================
 # 1. ИНИЦИАЛИЗАЦИЯ
@@ -521,6 +536,14 @@ async def analyze_document(file: UploadFile = File(...)):
         "entities": matched_entities
     }
 
+
+# Раздача фронтенда (index.html)
+os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+async def read_index():
+    return FileResponse("static/index.html")
 
 if __name__ == "__main__":
     import uvicorn
