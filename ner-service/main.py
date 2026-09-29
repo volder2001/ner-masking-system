@@ -15,6 +15,12 @@ from yargy import Parser
 from yargy.pipelines import morph_pipeline
 from yargy.interpretation import fact
 
+import io
+import pytesseract
+from pdf2image import convert_from_bytes
+from PIL import Image
+from fastapi import UploadFile, File
+
 app = FastAPI(title="NER Service", version="1.0.0")
 
 # ==========================================
@@ -396,6 +402,62 @@ def extract(request: NERRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ==========================================
+# 9. ТЕСТОВЫЙ ЭНДПОИНТ ДЛЯ ПРОВЕРКИ OCR
+# ==========================================
+import io
+import pytesseract
+from pdf2image import convert_from_bytes
+from PIL import Image
+from fastapi import UploadFile, File
+
+
+@app.post("/api/v1/ocr/test")
+async def test_ocr(file: UploadFile = File(...)):
+    """
+    Тестовый эндпоинт: принимает файл, возвращает текст и координаты слов из Tesseract.
+    """
+    file_bytes = await file.read()
+    filename = file.filename.lower()
+
+    # 1. Конвертация PDF в изображение
+    if filename.endswith('.pdf'):
+        images = convert_from_bytes(file_bytes, dpi=300, first_page=1, last_page=1)
+        image = images[0].convert("RGB")
+    else:
+        # Открываем картинку
+        image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+
+    # 2. Получаем текст и координаты через Tesseract
+    custom_config = r'--oem 3 --psm 6 -l rus+eng'
+    data = pytesseract.image_to_data(image, config=custom_config, output_type=pytesseract.Output.DICT)
+
+    # 3. Формируем список блоков с текстом
+    blocks = []
+    for i in range(len(data['text'])):
+        text = data['text'][i].strip()
+        conf = int(data['conf'][i])
+        # Берем только блоки с текстом и уверенностью > 30%
+        if text and conf > 30:
+            blocks.append({
+                "text": text,
+                "x": data['left'][i],
+                "y": data['top'][i],
+                "w": data['width'][i],
+                "h": data['height'][i],
+                "conf": conf
+            })
+
+    return {
+        "filename": file.filename,
+        "image_size": {"width": image.width, "height": image.height},
+        "blocks_count": len(blocks),
+        "blocks": blocks
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8002)
+
