@@ -412,35 +412,41 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 from fastapi import UploadFile, File
 
+# ==========================================
+# 9. ОСНОВНОЙ ЭНДПОИНТ ДЛЯ АНАЛИЗА ДОКУМЕНТОВ (OCR + NER)
+# ==========================================
+import base64
+import uuid
 
-@app.post("/api/v1/ocr/test")
-async def test_ocr(file: UploadFile = File(...)):
+
+@app.post("/api/v1/documents/analyze")
+async def analyze_document(file: UploadFile = File(...)):
     """
-    Тестовый эндпоинт: принимает файл, возвращает текст и координаты слов из Tesseract.
+    Принимает PDF или изображение, распознает текст с координатами,
+    находит конфиденциальные сущности через NER и возвращает всё вместе.
     """
     file_bytes = await file.read()
     filename = file.filename.lower()
 
-    # 1. Конвертация PDF в изображение
+    # 1. Конвертация PDF в изображение или открытие картинки
     if filename.endswith('.pdf'):
         images = convert_from_bytes(file_bytes, dpi=300, first_page=1, last_page=1)
         image = images[0].convert("RGB")
     else:
-        # Открываем картинку
         image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
     # 2. Получаем текст и координаты через Tesseract
     custom_config = r'--oem 3 --psm 6 -l rus+eng'
     data = pytesseract.image_to_data(image, config=custom_config, output_type=pytesseract.Output.DICT)
 
-    # 3. Формируем список блоков с текстом
-    blocks = []
+    ocr_blocks = []
+    full_text_parts = []
+
     for i in range(len(data['text'])):
         text = data['text'][i].strip()
         conf = int(data['conf'][i])
-        # Берем только блоки с текстом и уверенностью > 30%
         if text and conf > 30:
-            blocks.append({
+            ocr_blocks.append({
                 "text": text,
                 "x": data['left'][i],
                 "y": data['top'][i],
@@ -448,12 +454,71 @@ async def test_ocr(file: UploadFile = File(...)):
                 "h": data['height'][i],
                 "conf": conf
             })
+            full_text_parts.append(text)
+
+    # Собираем полный текст для NER (разделяем пробелами, как в документе)
+    full_text = " ".join(full_text_parts)
+
+    # 3. Прогоняем текст через наш NER
+    ner_entities, _ = extract_entities(full_text)
+
+    # Фильтруем только те типы сущностей, которые мы хотим маскировать
+    maskable_types = {'NAME', 'PASSPORT', 'MONEY_RUB', 'SUBJECT', 'INN', 'BANK_ACCOUNT', 'DATE'}
+    filtered_ner = [e for e in ner_entities if e.type in maskable_types]
+
+    # 4. Сопоставляем NER-сущности с OCR-блоками
+    matched_entities = []
+    used_block_indices = set()
+
+    for entity in filtered_ner:
+        # Очищаем текст сущности для сравнения
+        target_text = entity.text.strip().lower().replace('\n', ' ').replace('\r', '')
+
+        best_match = None
+        best_score = 0
+
+        for idx, block in enumerate(ocr_blocks):
+            if idx in used_block_indices:
+                continue
+
+            block_text = block['text'].lower()
+
+            # Эвристика совпадения: если текст сущности содержится в блоке или блок в сущности
+            if target_text in block_text or block_text in target_text:
+                # Оценка качества совпадения по длине общих символов
+                score = len(set(target_text) & set(block_text))
+                if score > best_score:
+                    best_score = score
+                    best_match = block
+                    best_match_idx = idx
+
+        if best_match and best_score > 3:  # Минимальный порог совпадения
+            used_block_indices.add(best_match_idx)
+            matched_entities.append({
+                "id": str(uuid.uuid4()),
+                "type": entity.type,
+                "text": entity.text,
+                "normal_form": entity.normal_form,
+                "bbox": {
+                    "x": best_match['x'],
+                    "y": best_match['y'],
+                    "w": best_match['w'],
+                    "h": best_match['h']
+                },
+                "is_masked": True  # По умолчанию предлагаем маскировать
+            })
+
+    # 5. Конвертируем изображение в base64 для отправки на фронтенд
+    buffered = io.BytesIO()
+    image.save(buffered, format="JPEG", quality=90)
+    img_base64 = f"data:image/jpeg;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
     return {
+        "document_id": str(uuid.uuid4()),
         "filename": file.filename,
-        "image_size": {"width": image.width, "height": image.height},
-        "blocks_count": len(blocks),
-        "blocks": blocks
+        "image_base64": img_base64,
+        "entities_count": len(matched_entities),
+        "entities": matched_entities
     }
 
 
