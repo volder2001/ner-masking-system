@@ -401,13 +401,6 @@ def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectM
 
     return final_pairs
 
-# ==========================================
-# 7. API ENDPOINTS
-# ==========================================
-@app.get("/")
-def read_root():
-    return {"status": "ok", "service": "ner-service", "dict_loaded_total": len(dictionary)}
-
 @app.post("/extract", response_model=NERResponse)
 def extract(request: NERRequest):
     try:
