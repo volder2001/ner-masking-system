@@ -1,3 +1,4 @@
+cat << 'HTMLEOF' > ner-service/static/index.html
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -7,46 +8,22 @@
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 20px; background: #f0f2f5; color: #333; }
         .container { display: flex; gap: 20px; max-width: 1600px; margin: 0 auto; height: 90vh; }
-
         .document-viewer { flex: 2; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); overflow: auto; position: relative; }
-
-        .upload-area {
-            border: 2px dashed #cbd5e1; padding: 40px; text-align: center;
-            border-radius: 8px; cursor: pointer; transition: all 0.2s; margin-bottom: 20px;
-            background: #fafafa;
-        }
-        .upload-area:hover, .upload-area.dragover {
-            border-color: #3b82f6; background: #eff6ff;
-        }
-
+        .upload-area { border: 2px dashed #cbd5e1; padding: 40px; text-align: center; border-radius: 8px; cursor: pointer; transition: all 0.2s; margin-bottom: 20px; background: #fafafa; }
+        .upload-area:hover, .upload-area.dragover { border-color: #3b82f6; background: #eff6ff; }
         .image-container { position: relative; display: inline-block; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-        .image-container img { max-width: 100%; display: block; }
-
-        .bbox {
-            position: absolute;
-            border: 2px solid rgba(239, 68, 68, 0.8);
-            background-color: rgba(239, 68, 68, 0.15);
-            cursor: pointer;
-            transition: all 0.2s ease;
-            border-radius: 4px;
-        }
+        .image-container img { display: block; max-width: 100%; height: auto; }
+        .bbox { position: absolute; border: 2px solid rgba(239, 68, 68, 0.8); background-color: rgba(239, 68, 68, 0.15); cursor: pointer; transition: all 0.2s ease; border-radius: 4px; }
         .bbox:hover { border-color: #3b82f6; background-color: rgba(59, 130, 246, 0.2); z-index: 10; }
-
-        .bbox.masked {
-            border: 2px solid #000;
-            background-color: rgba(0, 0, 0, 0.85);
-        }
-
-        .sidebar { flex: 1; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); display: flex; flex-direction: column; max-width: 400px; }
+        .bbox.masked { border: 2px solid #000; background-color: rgba(0, 0, 0, 0.85); }
+        .sidebar { flex: 1; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); display: flex; flex-direction: column; max-width: 450px; }
         .sidebar h3 { margin-top: 0; margin-bottom: 10px; font-size: 18px; }
         .sidebar p { color: #64748b; font-size: 14px; margin-bottom: 15px; }
-
         .entities-list { flex: 1; overflow-y: auto; border-top: 1px solid #e2e8f0; padding-top: 10px; }
         .entity-item { display: flex; align-items: flex-start; padding: 10px; border-radius: 6px; transition: background 0.2s; gap: 10px; margin-bottom: 5px; }
         .entity-item:hover { background: #f8fafc; }
         .entity-item input[type="checkbox"] { margin-top: 4px; cursor: pointer; transform: scale(1.2); }
         .entity-item label { cursor: pointer; flex: 1; font-size: 14px; line-height: 1.4; word-break: break-word; }
-
         .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: 4px; margin-right: 6px; text-transform: uppercase; }
         .badge-NAME { background: #fee2e2; color: #991b1b; }
         .badge-PASSPORT { background: #dbeafe; color: #1e40af; }
@@ -54,16 +31,20 @@
         .badge-DATE { background: #fef3c7; color: #92400e; }
         .badge-SUBJECT { background: #f3e8ff; color: #6b21a8; }
         .badge-default { background: #f1f5f9; color: #475569; }
-
         .btn { background: #3b82f6; color: white; border: none; padding: 12px; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: 600; width: 100%; margin-top: 15px; transition: background 0.2s; }
         .btn:hover { background: #2563eb; }
         .btn:disabled { background: #cbd5e1; cursor: not-allowed; }
-
         .loader { display: none; text-align: center; padding: 20px; color: #64748b; font-size: 18px; }
+        .pairs-section { border-top: 2px solid #e2e8f0; margin-top: 15px; padding-top: 15px; }
+        .pairs-section h4 { margin: 0 0 10px 0; font-size: 16px; color: #1e293b; }
+        .pair-item { display: flex; align-items: flex-start; padding: 10px; border-radius: 6px; background: #f8fafc; margin-bottom: 8px; gap: 10px; }
+        .pair-item input[type="checkbox"] { margin-top: 4px; cursor: pointer; transform: scale(1.2); }
+        .pair-content { flex: 1; font-size: 13px; line-height: 1.4; }
+        .pair-subject { color: #6b21a8; font-weight: 600; margin-bottom: 4px; }
+        .pair-money { color: #166534; font-weight: 600; }
     </style>
 </head>
 <body>
-
 <div class="container">
     <div class="document-viewer">
         <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
@@ -74,75 +55,43 @@
         <div class="loader" id="loader">⏳ Анализ документа и поиск персональных данных...</div>
         <div id="imageContainer" class="image-container"></div>
     </div>
-
     <div class="sidebar">
         <h3>🎯 Кандидаты на маскирование</h3>
         <p>Снимите галочку, чтобы исключить из закрашивания.</p>
-        <div class="entities-list" id="entitiesList">
-            <p style="text-align: center; color: #94a3b8; margin-top: 40px;">Загрузите документ</p>
+        <div class="entities-list" id="entitiesList"><p style="text-align: center; color: #94a3b8; margin-top: 40px;">Загрузите документ</p></div>
+        <div class="pairs-section" id="pairsSection" style="display: none;">
+            <h4>💰 Пары: предмет — сумма</h4>
+            <div id="pairsList"></div>
         </div>
         <button class="btn" id="maskBtn" onclick="applyMasking()" disabled>Применить маскирование</button>
     </div>
 </div>
-
 <script>
     let currentEntities = [];
+    let currentPairs = [];
+    let originalImageWidth = 0;
+    let originalImageHeight = 0;
 
-    // ===== DRAG AND DROP ЛОГИКА =====
     const uploadArea = document.getElementById('uploadArea');
-
-    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-        uploadArea.addEventListener(eventName, preventDefaults, false);
-    });
-
-    function preventDefaults(e) {
-        e.preventDefault();
-        e.stopPropagation();
-    }
-
-    ['dragenter', 'dragover'].forEach(eventName => {
-        uploadArea.addEventListener(eventName, () => uploadArea.classList.add('dragover'), false);
-    });
-
-    ['dragleave', 'drop'].forEach(eventName => {
-        uploadArea.addEventListener(eventName, () => uploadArea.classList.remove('dragover'), false);
-    });
-
-    uploadArea.addEventListener('drop', handleDrop, false);
-
-    function handleDrop(e) {
-        const dt = e.dataTransfer;
-        const files = dt.files;
-        if (files.length > 0) {
-            handleFileUpload(files[0]);
-        }
-    }
-    // ===== КОНЕЦ DRAG AND DROP =====
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => { uploadArea.addEventListener(eventName, (e) => { e.preventDefault(); e.stopPropagation(); }, false); });
+    ['dragenter', 'dragover'].forEach(eventName => { uploadArea.addEventListener(eventName, () => uploadArea.classList.add('dragover'), false); });
+    ['dragleave', 'drop'].forEach(eventName => { uploadArea.addEventListener(eventName, () => uploadArea.classList.remove('dragover'), false); });
+    uploadArea.addEventListener('drop', (e) => { e.preventDefault(); if (e.dataTransfer.files.length > 0) handleFileUpload(e.dataTransfer.files[0]); }, false);
 
     async function handleFileUpload(file) {
         if (!file) return;
-
         document.getElementById('loader').style.display = 'block';
         document.getElementById('imageContainer').innerHTML = '';
         document.getElementById('entitiesList').innerHTML = '';
+        document.getElementById('pairsSection').style.display = 'none';
         document.getElementById('maskBtn').disabled = true;
-
         const formData = new FormData();
         formData.append('file', file);
-
         try {
-            // Относительный URL! Браузер сам подставит адрес сервера
-            const response = await fetch('/api/v1/documents/analyze', {
-                method: 'POST',
-                body: formData
-            });
-
+            const response = await fetch('/api/v1/documents/analyze', { method: 'POST', body: formData });
             if (!response.ok) throw new Error('Ошибка сервера: ' + response.status);
-            const data = await response.json();
-
-            renderDocument(data);
+            renderDocument(await response.json());
         } catch (error) {
-            console.error(error);
             alert('Ошибка при анализе: ' + error.message);
             document.getElementById('loader').style.display = 'none';
         }
@@ -151,50 +100,80 @@
     function renderDocument(data) {
         const container = document.getElementById('imageContainer');
         const list = document.getElementById('entitiesList');
-        container.innerHTML = '';
-        list.innerHTML = '';
+        const pairsList = document.getElementById('pairsList');
+        container.innerHTML = ''; list.innerHTML = ''; pairsList.innerHTML = '';
         currentEntities = data.entities;
+        currentPairs = data.subject_money_pairs || [];
         document.getElementById('loader').style.display = 'none';
-
+        
         const img = document.createElement('img');
         img.src = data.image_base64;
         img.onload = () => {
+            originalImageWidth = img.naturalWidth;
+            originalImageHeight = img.naturalHeight;
+            
             currentEntities.forEach((entity, index) => {
                 const bbox = document.createElement('div');
                 bbox.className = 'bbox masked';
                 bbox.dataset.index = index;
-                bbox.style.left = entity.bbox.x + 'px';
-                bbox.style.top = entity.bbox.y + 'px';
-                bbox.style.width = entity.bbox.w + 'px';
-                bbox.style.height = entity.bbox.h + 'px';
+                
+                const scaleX = img.clientWidth / originalImageWidth;
+                const scaleY = img.clientHeight / originalImageHeight;
+                
+                bbox.style.left = (entity.bbox.x * scaleX) + 'px';
+                bbox.style.top = (entity.bbox.y * scaleY) + 'px';
+                bbox.style.width = (entity.bbox.w * scaleX) + 'px';
+                bbox.style.height = (entity.bbox.h * scaleY) + 'px';
+                
                 bbox.title = `${entity.type}: ${entity.text}`;
-
                 bbox.onclick = () => toggleEntity(index);
                 container.appendChild(bbox);
             });
         };
+        
+        window.addEventListener('resize', () => {
+            if (img.complete) {
+                currentEntities.forEach((entity, index) => {
+                    const bbox = document.querySelector(`.bbox[data-index="${index}"]`);
+                    if (bbox) {
+                        const scaleX = img.clientWidth / originalImageWidth;
+                        const scaleY = img.clientHeight / originalImageHeight;
+                        bbox.style.left = (entity.bbox.x * scaleX) + 'px';
+                        bbox.style.top = (entity.bbox.y * scaleY) + 'px';
+                        bbox.style.width = (entity.bbox.w * scaleX) + 'px';
+                        bbox.style.height = (entity.bbox.h * scaleY) + 'px';
+                    }
+                });
+            }
+        });
+        
         container.appendChild(img);
 
         currentEntities.forEach((entity, index) => {
-            const item = document.createElement('div');
-            item.className = 'entity-item';
-
+            const item = document.createElement('div'); item.className = 'entity-item';
             const checkbox = document.createElement('input');
-            checkbox.type = 'checkbox';
-            checkbox.checked = entity.is_masked;
-            checkbox.id = `chk_${index}`;
+            checkbox.type = 'checkbox'; checkbox.checked = entity.is_masked; checkbox.id = `chk_${index}`;
             checkbox.onchange = () => toggleEntity(index);
-
-            const label = document.createElement('label');
-            label.htmlFor = `chk_${index}`;
-
-            const badgeClass = `badge-${entity.type}`;
-            label.innerHTML = `<span class="badge ${badgeClass}">${entity.type}</span> ${entity.text}`;
-
-            item.appendChild(checkbox);
-            item.appendChild(label);
-            list.appendChild(item);
+            const label = document.createElement('label'); label.htmlFor = `chk_${index}`;
+            label.innerHTML = `<span class="badge badge-${entity.type}">${entity.type}</span> ${entity.text}`;
+            item.appendChild(checkbox); item.appendChild(label); list.appendChild(item);
         });
+
+        if (currentPairs.length > 0) {
+            document.getElementById('pairsSection').style.display = 'block';
+            currentPairs.forEach((pair, index) => {
+                const pairItem = document.createElement('div'); pairItem.className = 'pair-item';
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox'; checkbox.checked = true; checkbox.id = `pair_chk_${index}`;
+                checkbox.onchange = () => togglePair(index);
+                const content = document.createElement('div'); content.className = 'pair-content';
+                content.innerHTML = `
+                    <div class="pair-subject">${pair.subject.text}</div>
+                    <div class="pair-money">→ ${pair.money.text}</div>
+                `;
+                pairItem.appendChild(checkbox); pairItem.appendChild(content); pairsList.appendChild(pairItem);
+            });
+        }
 
         document.getElementById('maskBtn').disabled = false;
     }
@@ -202,25 +181,37 @@
     function toggleEntity(index) {
         const entity = currentEntities[index];
         entity.is_masked = !entity.is_masked;
-
         const checkbox = document.getElementById(`chk_${index}`);
         if (checkbox) checkbox.checked = entity.is_masked;
-
         const bbox = document.querySelector(`.bbox[data-index="${index}"]`);
-        if (bbox) {
-            if (entity.is_masked) {
-                bbox.classList.add('masked');
-            } else {
-                bbox.classList.remove('masked');
+        if (bbox) entity.is_masked ? bbox.classList.add('masked') : bbox.classList.remove('masked');
+    }
+
+    function togglePair(index) {
+        const pair = currentPairs[index];
+        const checkbox = document.getElementById(`pair_chk_${index}`);
+        const isMasked = checkbox.checked;
+        
+        currentEntities.forEach((entity, idx) => {
+            if (entity.id === pair.subject.id || entity.id === pair.money.id) {
+                entity.is_masked = isMasked;
+                const chk = document.getElementById(`chk_${idx}`);
+                if (chk) chk.checked = isMasked;
+                const bbox = document.querySelector(`.bbox[data-index="${idx}"]`);
+                if (bbox) isMasked ? bbox.classList.add('masked') : bbox.classList.remove('masked');
             }
-        }
+        });
     }
 
     function applyMasking() {
-        const maskedEntities = currentEntities.filter(e => e.is_masked);
-        alert(`Готово! Будет закрашено ${maskedEntities.length} элементов.\n(На следующем шаге добавим генерацию финального PDF)`);
+        const masked = currentEntities.filter(e => e.is_masked);
+        alert(`Готово! Будет закрашено ${masked.length} элементов.\n(Следующий шаг: генерация финального PDF)`);
     }
 </script>
-
 </body>
 </html>
+HTMLEOF
+
+docker cp ner-service/static/index.html ner_ner_service:/app/static/index.html
+docker compose restart ner-service
+sleep 3

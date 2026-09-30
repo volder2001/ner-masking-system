@@ -339,6 +339,117 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     return unique_entities, case_info
 
 
+def match_ner_to_ocr(ner_entities: list, ocr_blocks: list, full_text: str) -> list:
+    """
+    Сопоставляет NER-сущности с OCR-координатами.
+    Находит ВСЕ вхождения каждой сущности и объединяет bbox.
+    """
+    # Сортируем OCR-блоки по позиции (y, затем x)
+    sorted_blocks = sorted(enumerate(ocr_blocks), key=lambda x: (x[1]['y'], x[1]['x']))
+
+    # Собираем полный текст с маппингом позиций
+    text_with_positions = []
+    for idx, block in sorted_blocks:
+        text = block['text']
+        for ch in text:
+            text_with_positions.append((ch.lower(), idx))
+        text_with_positions.append((' ', idx))
+
+    full_text_lower = ''.join([t[0] for t in text_with_positions])
+
+    matched_entities = []
+    used_positions = set()
+
+    for entity in ner_entities:
+        target_text = entity.text.strip().lower().replace('\n', ' ').replace('\r', '')
+        target_norm = entity.normal_form.lower()
+
+        # Ищем все вхождения
+        search_texts = [target_text, target_norm]
+        found_ranges = []
+
+        for search_text in search_texts:
+            if not search_text or len(search_text) < 3:
+                continue
+            start = 0
+            while True:
+                pos = full_text_lower.find(search_text, start)
+                if pos == -1:
+                    break
+                found_ranges.append((pos, pos + len(search_text)))
+                start = pos + 1
+
+        # Если точного вхождения не нашли, используем fallback по словам
+        if not found_ranges:
+            target_words = set(re.findall(r'\w+', target_text))
+            if target_words:
+                for i, (idx, block) in enumerate(sorted_blocks):
+                    block_words = set(re.findall(r'\w+', block['text'].lower()))
+                    if target_words & block_words:
+                        covered_indices = [idx]
+                        for j in range(max(0, i - 2), min(len(sorted_blocks), i + 3)):
+                            other_idx, other_block = sorted_blocks[j]
+                            other_words = set(re.findall(r'\w+', other_block['text'].lower()))
+                            if target_words & other_words:
+                                covered_indices.append(other_idx)
+
+                        if covered_indices:
+                            min_x = min(ocr_blocks[i]['x'] for i in covered_indices)
+                            min_y = min(ocr_blocks[i]['y'] for i in covered_indices)
+                            max_x = max(ocr_blocks[i]['x'] + ocr_blocks[i]['w'] for i in covered_indices)
+                            max_y = max(ocr_blocks[i]['y'] + ocr_blocks[i]['h'] for i in covered_indices)
+
+                            dedup_key = f"{target_norm}_{min_x}_{min_y}"
+                            if dedup_key not in used_positions:
+                                used_positions.add(dedup_key)
+                                matched_entities.append({
+                                    "id": str(uuid.uuid4()),
+                                    "type": entity.type,
+                                    "text": entity.text,
+                                    "normal_form": entity.normal_form,
+                                    "bbox": {
+                                        "x": min_x,
+                                        "y": min_y,
+                                        "w": max_x - min_x,
+                                        "h": max_y - min_y
+                                    },
+                                    "is_masked": True
+                                })
+            continue
+
+        # Обрабатываем все найденные вхождения
+        for pos_start, pos_end in found_ranges:
+            covered_blocks = []
+            for i in range(pos_start, min(pos_end, len(text_with_positions))):
+                block_idx = text_with_positions[i][1]
+                if block_idx not in covered_blocks:
+                    covered_blocks.append(block_idx)
+
+            if covered_blocks:
+                min_x = min(ocr_blocks[i]['x'] for i in covered_blocks)
+                min_y = min(ocr_blocks[i]['y'] for i in covered_blocks)
+                max_x = max(ocr_blocks[i]['x'] + ocr_blocks[i]['w'] for i in covered_blocks)
+                max_y = max(ocr_blocks[i]['y'] + ocr_blocks[i]['h'] for i in covered_blocks)
+
+                dedup_key = f"{target_norm}_{pos_start}"
+                if dedup_key not in used_positions:
+                    used_positions.add(dedup_key)
+                    matched_entities.append({
+                        "id": str(uuid.uuid4()),
+                        "type": entity.type,
+                        "text": entity.text,
+                        "normal_form": entity.normal_form,
+                        "bbox": {
+                            "x": min_x,
+                            "y": min_y,
+                            "w": max_x - min_x,
+                            "h": max_y - min_y
+                        },
+                        "is_masked": True
+                    })
+
+    return matched_entities
+
 def link_subject_money_pairs(entities: List[Entity], text: str) -> List[SubjectMoneyPair]:
     subjects = [e for e in entities if e.type == 'SUBJECT']
     money_entities = [e for e in entities if e.type.startswith('MONEY')]
@@ -475,46 +586,36 @@ async def analyze_document(file: UploadFile = File(...)):
     filtered_ner = [e for e in ner_entities if e.type in maskable_types]
 
     # 4. Сопоставляем NER-сущности с OCR-блоками
-    matched_entities = []
-    used_block_indices = set()
+    # 4. Сопоставляем NER-сущности с OCR-блоками (улучшенная версия)
+    matched_entities = match_ner_to_ocr(filtered_ner, ocr_blocks, full_text)
 
-    for entity in filtered_ner:
-        # Очищаем текст сущности для сравнения
-        target_text = entity.text.strip().lower().replace('\n', ' ').replace('\r', '')
+    # 5. Связываем SUBJECT с MONEY для отображения пар
+    subject_money_pairs = link_subject_money_pairs(filtered_ner, full_text)
 
-        best_match = None
-        best_score = 0
+    # Конвертируем пары в словари для JSON
+    pairs_for_json = []
+    for pair in subject_money_pairs:
+        if pair.money is not None:
+            # Находим ID сущностей в matched_entities
+            subject_id = next((e["id"] for e in matched_entities if e["text"] == pair.subject.text), None)
+            money_id = next((e["id"] for e in matched_entities if e["text"] == pair.money.text), None)
 
-        for idx, block in enumerate(ocr_blocks):
-            if idx in used_block_indices:
-                continue
-
-            block_text = block['text'].lower()
-
-            # Эвристика совпадения: если текст сущности содержится в блоке или блок в сущности
-            if target_text in block_text or block_text in target_text:
-                # Оценка качества совпадения по длине общих символов
-                score = len(set(target_text) & set(block_text))
-                if score > best_score:
-                    best_score = score
-                    best_match = block
-                    best_match_idx = idx
-
-        if best_match and best_score > 3:  # Минимальный порог совпадения
-            used_block_indices.add(best_match_idx)
-            matched_entities.append({
-                "id": str(uuid.uuid4()),
-                "type": entity.type,
-                "text": entity.text,
-                "normal_form": entity.normal_form,
-                "bbox": {
-                    "x": best_match['x'],
-                    "y": best_match['y'],
-                    "w": best_match['w'],
-                    "h": best_match['h']
+            pairs_for_json.append({
+                "subject": {
+                    "id": subject_id,
+                    "type": pair.subject.type,
+                    "text": pair.subject.text,
+                    "normal_form": pair.subject.normal_form
                 },
-                "is_masked": True  # По умолчанию предлагаем маскировать
+                "money": {
+                    "id": money_id,
+                    "type": pair.money.type,
+                    "text": pair.money.text,
+                    "normal_form": pair.money.normal_form
+                }
             })
+
+
 
     # 5. Конвертируем изображение в base64 для отправки на фронтенд
     buffered = io.BytesIO()
@@ -526,7 +627,8 @@ async def analyze_document(file: UploadFile = File(...)):
         "filename": file.filename,
         "image_base64": img_base64,
         "entities_count": len(matched_entities),
-        "entities": matched_entities
+        "entities": matched_entities,
+        "subject_money_pairs": pairs_for_json
     }
 
 
