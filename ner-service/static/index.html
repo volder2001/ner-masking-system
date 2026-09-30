@@ -14,6 +14,27 @@
         .image-container img { display: block; max-width: 100%; height: auto; }
         .bbox { position: absolute; border: 2px solid rgba(239, 68, 68, 0.8); background-color: rgba(239, 68, 68, 0.15); cursor: pointer; transition: all 0.2s ease; border-radius: 4px; z-index: 1; }
         .bbox:hover { border-color: #3b82f6; background-color: rgba(59, 130, 246, 0.3); z-index: 100; }
+                .bbox::after {
+            content: attr(data-tooltip);
+            position: absolute;
+            bottom: calc(100% + 8px);
+            left: 50%;
+            transform: translateX(-50%);
+            background: #1e293b;
+            color: white;
+            padding: 6px 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            white-space: nowrap;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s;
+            z-index: 1000;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+        .bbox:hover::after {
+            opacity: 1;
+        }
         .bbox.masked { border: 2px solid #000; background-color: rgba(0, 0, 0, 0.85); }
         .sidebar { flex: 1; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); display: flex; flex-direction: column; max-width: 500px; }
         .sidebar h3 { margin-top: 0; margin-bottom: 10px; font-size: 18px; }
@@ -224,6 +245,7 @@
                     bbox.style.height = (entity.bbox.h * scaleY) + 'px';
 
                     bbox.title = `${entity.type}: ${entity.text}`;
+                    bbox.dataset.tooltip = `${entity.type}: ${entity.text}`;
                     bbox.onclick = (e) => { e.stopPropagation(); toggleEntity(index); };
                     container.appendChild(bbox);
                 });
