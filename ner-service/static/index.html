@@ -35,10 +35,12 @@
         .btn { background: #3b82f6; color: white; border: none; padding: 12px; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: 600; width: 100%; margin-top: 15px; transition: background 0.2s; }
         .btn:hover { background: #2563eb; }
         .btn:disabled { background: #cbd5e1; cursor: not-allowed; }
+        .btn-secondary { background: #64748b; font-size: 14px; padding: 10px; margin-top: 10px; }
+        .btn-secondary:hover { background: #475569; }
         .loader { display: none; text-align: center; padding: 20px; color: #64748b; font-size: 18px; }
         .pairs-section { border-top: 2px solid #e2e8f0; margin-top: 15px; padding-top: 15px; }
         .pairs-section h4 { margin: 0 0 10px 0; font-size: 16px; color: #1e293b; }
-        .pair-item { display: flex; align-items: flex-start; padding: 10px; border-radius: 6px; background: #f8fafc; margin-bottom: 8px; gap: 10px; position: relative; }
+        .pair-item { display: flex; align-items: flex-start; padding: 10px; border-radius: 6px; background: #f8fafc; margin-bottom: 8px; gap: 10px; position: relative; cursor: pointer; }
         .pair-item:hover { background: #e0f2fe; }
         .pair-item input[type="checkbox"] { margin-top: 4px; cursor: pointer; transform: scale(1.2); }
         .pair-content { flex: 1; font-size: 13px; line-height: 1.4; }
@@ -46,26 +48,70 @@
         .pair-money { color: #166534; font-weight: 600; }
         .pair-context {
             display: none;
-            position: absolute;
-            left: 100%;
-            top: 0;
+            margin-top: 8px;
+            padding: 8px;
             background: #1e293b;
-            color: white;
-            padding: 10px;
+            color: #e2e8f0;
             border-radius: 6px;
             font-size: 12px;
-            max-width: 300px;
-            z-index: 1000;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-            margin-left: 10px;
+            line-height: 1.5;
+            font-style: italic;
         }
-        .pair-item:hover .pair-context { display: block; }
-        .overlap-indicator {
-            font-size: 10px;
-            color: #64748b;
-            margin-left: 5px;
+        .pair-item.expanded .pair-context { display: block; }
+        .select-all-bar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background: #f1f5f9;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .select-all-bar input[type="checkbox"] { transform: scale(1.3); cursor: pointer; }
+
+        /* Модальное окно */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.6);
+            z-index: 2000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-overlay.active { display: flex; }
+        .modal {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            max-width: 900px;
+            width: 90%;
+            max-height: 85vh;
+            overflow-y: auto;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }
+        .modal h3 { margin-top: 0; }
+        .modal pre {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-size: 13px;
+            max-height: 60vh;
+            overflow-y: auto;
+        }
+        .modal-close {
+            float: right;
+            background: none;
+            border: none;
+            font-size: 24px;
             cursor: pointer;
+            color: #64748b;
         }
+        .modal-close:hover { color: #000; }
     </style>
 </head>
 <body>
@@ -81,22 +127,35 @@
     </div>
     <div class="sidebar">
         <h3>🎯 Кандидаты на маскирование</h3>
-        <p>Снимите галочку, чтобы исключить из закрашивания. <span class="overlap-indicator" title="Если области накладываются, кликните несколько раз чтобы переключить нужную">️</span></p>
+        <div class="select-all-bar">
+            <input type="checkbox" id="selectAll" onchange="toggleSelectAll()">
+            <label for="selectAll" style="cursor: pointer;">Выбрать все / Снять все</label>
+        </div>
         <div class="entities-list" id="entitiesList"><p style="text-align: center; color: #94a3b8; margin-top: 40px;">Загрузите документ</p></div>
         <div class="pairs-section" id="pairsSection" style="display: none;">
-            <h4> Пары: предмет — сумма</h4>
+            <h4>💰 Пары: предмет — сумма <span style="font-size: 12px; color: #64748b; font-weight: normal;">(клик для контекста)</span></h4>
             <div id="pairsList"></div>
         </div>
         <button class="btn" id="maskBtn" onclick="applyMasking()" disabled>Применить маскирование</button>
+        <button class="btn btn-secondary" id="jsonBtn" onclick="showJsonModal()" disabled>📋 Показать JSON</button>
     </div>
 </div>
+
+<!-- Модальное окно с JSON -->
+<div class="modal-overlay" id="jsonModal">
+    <div class="modal">
+        <button class="modal-close" onclick="closeJsonModal()">×</button>
+        <h3>📋 Результат анализа (NER JSON)</h3>
+        <pre id="jsonContent"></pre>
+    </div>
+</div>
+
 <script>
     let currentEntities = [];
     let currentPairs = [];
     let originalImageWidth = 0;
     let originalImageHeight = 0;
-    let clickTimeout = null;
-    let pendingBboxes = [];
+    let lastAnalyzeResponse = null;
 
     const uploadArea = document.getElementById('uploadArea');
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => { uploadArea.addEventListener(eventName, (e) => { e.preventDefault(); e.stopPropagation(); }, false); });
@@ -111,12 +170,14 @@
         document.getElementById('entitiesList').innerHTML = '';
         document.getElementById('pairsSection').style.display = 'none';
         document.getElementById('maskBtn').disabled = true;
+        document.getElementById('jsonBtn').disabled = true;
         const formData = new FormData();
         formData.append('file', file);
         try {
             const response = await fetch('/api/v1/documents/analyze', { method: 'POST', body: formData });
             if (!response.ok) throw new Error('Ошибка сервера: ' + response.status);
-            renderDocument(await response.json());
+            lastAnalyzeResponse = await response.json();
+            renderDocument(lastAnalyzeResponse);
         } catch (error) {
             alert('Ошибка при анализе: ' + error.message);
             document.getElementById('loader').style.display = 'none';
@@ -131,6 +192,7 @@
         currentEntities = data.entities;
         currentPairs = data.subject_money_pairs || [];
         document.getElementById('loader').style.display = 'none';
+        document.getElementById('jsonBtn').disabled = false;
 
         const img = document.createElement('img');
         img.src = data.image_base64;
@@ -138,7 +200,6 @@
             originalImageWidth = img.naturalWidth;
             originalImageHeight = img.naturalHeight;
 
-            // Группируем bbox по позициям для обработки перекрытий
             const bboxGroups = {};
             currentEntities.forEach((entity, index) => {
                 const key = `${entity.bbox.x}_${entity.bbox.y}`;
@@ -146,7 +207,6 @@
                 bboxGroups[key].push({entity, index});
             });
 
-            // Создаем рамки
             Object.values(bboxGroups).forEach(group => {
                 group.forEach(({entity, index}, groupIndex) => {
                     const bbox = document.createElement('div');
@@ -156,7 +216,6 @@
                     const scaleX = img.clientWidth / originalImageWidth;
                     const scaleY = img.clientHeight / originalImageHeight;
 
-                    // Небольшой сдвиг для перекрывающихся областей
                     const offset = group.length > 1 ? (groupIndex * 3) : 0;
 
                     bbox.style.left = (entity.bbox.x * scaleX) + 'px';
@@ -164,17 +223,8 @@
                     bbox.style.width = (entity.bbox.w * scaleX) + 'px';
                     bbox.style.height = (entity.bbox.h * scaleY) + 'px';
 
-                    if (group.length > 1) {
-                        bbox.title = `${entity.type}: ${entity.text}\n(Перекрывается с ${group.length-1} другими. Кликните несколько раз)`;
-                    } else {
-                        bbox.title = `${entity.type}: ${entity.text}`;
-                    }
-
-                    bbox.onclick = (e) => {
-                        e.stopPropagation();
-                        handleBboxClick(index, group, groupIndex);
-                    };
-
+                    bbox.title = `${entity.type}: ${entity.text}`;
+                    bbox.onclick = (e) => { e.stopPropagation(); toggleEntity(index); };
                     container.appendChild(bbox);
                 });
             });
@@ -198,7 +248,7 @@
 
         container.appendChild(img);
 
-        // Группируем сущности по категориям
+        // Группировка по категориям
         const categories = {};
         currentEntities.forEach((entity, index) => {
             if (!categories[entity.type]) categories[entity.type] = [];
@@ -211,10 +261,10 @@
             'PASSPORT': '🛂 Паспорт',
             'DATE': '📅 Даты',
             'MONEY_RUB': '💰 Суммы',
-            'SUBJECT': ' Статьи долга',
+            'SUBJECT': '📋 Статьи долга',
             'INN': '🏢 ИНН',
             'OGRN': '🏢 ОГРН',
-            'BANK_ACCOUNT': '💳 Счета'
+            'BANK_ACCOUNT': ' Счета'
         };
 
         categoryOrder.forEach(category => {
@@ -234,7 +284,7 @@
                     checkbox.type = 'checkbox';
                     checkbox.checked = entity.is_masked;
                     checkbox.id = `chk_${index}`;
-                    checkbox.onchange = () => toggleEntity(index);
+                    checkbox.onchange = () => { toggleEntity(index); updateSelectAllState(); };
 
                     const label = document.createElement('label');
                     label.htmlFor = `chk_${index}`;
@@ -249,7 +299,7 @@
             }
         });
 
-        // Отображаем пары с контекстом
+        // Пары с раскрывающимся контекстом
         if (currentPairs.length > 0) {
             document.getElementById('pairsSection').style.display = 'block';
             currentPairs.forEach((pair, index) => {
@@ -260,7 +310,7 @@
                 checkbox.type = 'checkbox';
                 checkbox.checked = true;
                 checkbox.id = `pair_chk_${index}`;
-                checkbox.onchange = () => togglePair(index);
+                checkbox.onchange = (e) => { e.stopPropagation(); togglePair(index); };
 
                 const content = document.createElement('div');
                 content.className = 'pair-content';
@@ -270,6 +320,13 @@
                     ${pair.context ? `<div class="pair-context"><strong>Контекст:</strong><br>${pair.context}</div>` : ''}
                 `;
 
+                // Клик по карточке раскрывает контекст
+                pairItem.onclick = (e) => {
+                    if (e.target.tagName !== 'INPUT') {
+                        pairItem.classList.toggle('expanded');
+                    }
+                };
+
                 pairItem.appendChild(checkbox);
                 pairItem.appendChild(content);
                 pairsList.appendChild(pairItem);
@@ -277,27 +334,7 @@
         }
 
         document.getElementById('maskBtn').disabled = false;
-    }
-
-    function handleBboxClick(index, group, groupIndex) {
-        // Обработка перекрывающихся областей — циклическое переключение
-        if (clickTimeout) {
-            clearTimeout(clickTimeout);
-        }
-
-        clickTimeout = setTimeout(() => {
-            const entity = currentEntities[index];
-            entity.is_masked = !entity.is_masked;
-
-            const checkbox = document.getElementById(`chk_${index}`);
-            if (checkbox) checkbox.checked = entity.is_masked;
-
-            const bbox = document.querySelector(`.bbox[data-index="${index}"]`);
-            if (bbox) entity.is_masked ? bbox.classList.add('masked') : bbox.classList.remove('masked');
-
-            clickTimeout = null;
-            pendingBboxes = [];
-        }, 250);
+        updateSelectAllState();
     }
 
     function toggleEntity(index) {
@@ -307,6 +344,7 @@
         if (checkbox) checkbox.checked = entity.is_masked;
         const bbox = document.querySelector(`.bbox[data-index="${index}"]`);
         if (bbox) entity.is_masked ? bbox.classList.add('masked') : bbox.classList.remove('masked');
+        updateSelectAllState();
     }
 
     function togglePair(index) {
@@ -314,17 +352,12 @@
         const checkbox = document.getElementById(`pair_chk_${index}`);
         const isMasked = checkbox.checked;
 
-        // Находим и переключаем SUBJECT
+        // Ищем ВСЕ сущности с таким же текстом и типом (не только по ID!)
         currentEntities.forEach((entity, idx) => {
-            if (entity.id === pair.subject.id) {
-                entity.is_masked = isMasked;
-                const chk = document.getElementById(`chk_${idx}`);
-                if (chk) chk.checked = isMasked;
-                const bbox = document.querySelector(`.bbox[data-index="${idx}"]`);
-                if (bbox) isMasked ? bbox.classList.add('masked') : bbox.classList.remove('masked');
-            }
-            // Находим и переключаем MONEY
-            if (entity.id === pair.money.id) {
+            const isSubject = entity.text === pair.subject.text && entity.type === pair.subject.type;
+            const isMoney = entity.text === pair.money.text && entity.type === pair.money.type;
+
+            if (isSubject || isMoney) {
                 entity.is_masked = isMasked;
                 const chk = document.getElementById(`chk_${idx}`);
                 if (chk) chk.checked = isMasked;
@@ -332,12 +365,50 @@
                 if (bbox) isMasked ? bbox.classList.add('masked') : bbox.classList.remove('masked');
             }
         });
+        updateSelectAllState();
+    }
+
+    function toggleSelectAll() {
+        const selectAllCheckbox = document.getElementById('selectAll');
+        const newState = selectAllCheckbox.checked;
+
+        currentEntities.forEach((entity, index) => {
+            entity.is_masked = newState;
+            const checkbox = document.getElementById(`chk_${index}`);
+            if (checkbox) checkbox.checked = newState;
+            const bbox = document.querySelector(`.bbox[data-index="${index}"]`);
+            if (bbox) newState ? bbox.classList.add('masked') : bbox.classList.remove('masked');
+        });
+    }
+
+    function updateSelectAllState() {
+        const selectAllCheckbox = document.getElementById('selectAll');
+        const allMasked = currentEntities.length > 0 && currentEntities.every(e => e.is_masked);
+        const noneMasked = currentEntities.every(e => !e.is_masked);
+        selectAllCheckbox.checked = allMasked;
+        selectAllCheckbox.indeterminate = !allMasked && !noneMasked;
+    }
+
+    function showJsonModal() {
+        const modal = document.getElementById('jsonModal');
+        const content = document.getElementById('jsonContent');
+        content.textContent = JSON.stringify(lastAnalyzeResponse, null, 2);
+        modal.classList.add('active');
+    }
+
+    function closeJsonModal() {
+        document.getElementById('jsonModal').classList.remove('active');
     }
 
     function applyMasking() {
         const masked = currentEntities.filter(e => e.is_masked);
         alert(`Готово! Будет закрашено ${masked.length} элементов.\n(Следующий шаг: генерация финального PDF)`);
     }
+
+    // Закрытие модалки по клику на фон
+    document.getElementById('jsonModal').addEventListener('click', (e) => {
+        if (e.target.id === 'jsonModal') closeJsonModal();
+    });
 </script>
 </body>
 </html>

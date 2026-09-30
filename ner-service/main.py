@@ -599,28 +599,35 @@ async def analyze_document(file: UploadFile = File(...)):
     # 5. Связываем SUBJECT с MONEY для отображения пар
     subject_money_pairs = link_subject_money_pairs(filtered_ner, full_text)
 
+
     # Конвертируем пары в словари для JSON
     pairs_for_json = []
     for pair in subject_money_pairs:
         if pair.money is not None:
-            # Находим ID сущностей в matched_entities
-            subject_id = next((e["id"] for e in matched_entities if e["text"] == pair.subject.text), None)
-            money_id = next((e["id"] for e in matched_entities if e["text"] == pair.money.text), None)
+            # Находим ВСЕ сущности с таким же текстом и типом (не только первую!)
+            subject_ids = [
+                e["id"] for e in matched_entities
+                if e["text"] == pair.subject.text and e["type"] == pair.subject.type
+            ]
+            money_ids = [
+                e["id"] for e in matched_entities
+                if e["text"] == pair.money.text and e["type"] == pair.money.type
+            ]
 
             pairs_for_json.append({
                 "subject": {
-                    "id": subject_id,
+                    "ids": subject_ids,  # <-- Теперь список ID
                     "type": pair.subject.type,
                     "text": pair.subject.text,
                     "normal_form": pair.subject.normal_form
                 },
                 "money": {
-                    "id": money_id,
+                    "ids": money_ids,  # <-- Теперь список ID
                     "type": pair.money.type,
                     "text": pair.money.text,
                     "normal_form": pair.money.normal_form
                 },
-                "context": pair.context
+                "context": pair.context if hasattr(pair, 'context') else None
             })
 
 
