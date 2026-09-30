@@ -366,8 +366,6 @@ def match_ner_to_ocr(ner_entities: list, ocr_blocks: list, full_text: str) -> li
 
         # Для MONEY_RUB — ищем только цифры, не слова "руб"
         if entity.type == 'MONEY_RUB':
-            # Извлекаем цифры из текста
-            import re
             money_numbers = re.findall(r'\d{1,3}(?:\s?\d{3})*(?:[.,]\d{1,2})?', target_text)
             if money_numbers:
                 search_text = money_numbers[0]  # Берем первое число
