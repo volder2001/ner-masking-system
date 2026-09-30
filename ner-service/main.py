@@ -616,18 +616,18 @@ async def analyze_document(file: UploadFile = File(...)):
 
             pairs_for_json.append({
                 "subject": {
-                    "ids": subject_ids,  # <-- Теперь список ID
+                    "id": subject_id,
                     "type": pair.subject.type,
                     "text": pair.subject.text,
                     "normal_form": pair.subject.normal_form
                 },
                 "money": {
-                    "ids": money_ids,  # <-- Теперь список ID
+                    "id": money_id,
                     "type": pair.money.type,
                     "text": pair.money.text,
                     "normal_form": pair.money.normal_form
                 },
-                "context": pair.context if hasattr(pair, 'context') else None
+                "context": pair.context  # <-- ДОБАВЛЕН КОНТЕКСТ
             })
 
 
