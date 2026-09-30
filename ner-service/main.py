@@ -341,7 +341,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 
 def match_ner_to_ocr(ner_entities: list, ocr_blocks: list, full_text: str) -> list:
     """
-    Сопоставляет NER-сущности с OCR-координатами.
+    Улучшенное сопоставление NER-сущностей с OCR-координатами.
     Находит ВСЕ вхождения каждой сущности и объединяет bbox.
     """
     # Сортируем OCR-блоки по позиции (y, затем x)
@@ -364,13 +364,21 @@ def match_ner_to_ocr(ner_entities: list, ocr_blocks: list, full_text: str) -> li
         target_text = entity.text.strip().lower().replace('\n', ' ').replace('\r', '')
         target_norm = entity.normal_form.lower()
 
-        # Ищем все вхождения
-        search_texts = [target_text, target_norm]
-        found_ranges = []
+        # Для MONEY_RUB — ищем только цифры, не слова "руб"
+        if entity.type == 'MONEY_RUB':
+            # Извлекаем цифры из текста
+            import re
+            money_numbers = re.findall(r'\d{1,3}(?:\s?\d{3})*(?:[.,]\d{1,2})?', target_text)
+            if money_numbers:
+                search_text = money_numbers[0]  # Берем первое число
+            else:
+                search_text = target_text
+        else:
+            search_text = target_text
 
-        for search_text in search_texts:
-            if not search_text or len(search_text) < 3:
-                continue
+        # Ищем все вхождения
+        found_ranges = []
+        if len(search_text) >= 3:
             start = 0
             while True:
                 pos = full_text_lower.find(search_text, start)
@@ -379,13 +387,14 @@ def match_ner_to_ocr(ner_entities: list, ocr_blocks: list, full_text: str) -> li
                 found_ranges.append((pos, pos + len(search_text)))
                 start = pos + 1
 
-        # Если точного вхождения не нашли, используем fallback по словам
+        # Если не нашли точного вхождения, используем fallback
         if not found_ranges:
             target_words = set(re.findall(r'\w+', target_text))
             if target_words:
                 for i, (idx, block) in enumerate(sorted_blocks):
                     block_words = set(re.findall(r'\w+', block['text'].lower()))
                     if target_words & block_words:
+                        # Проверяем соседние блоки для многословных сущностей
                         covered_indices = [idx]
                         for j in range(max(0, i - 2), min(len(sorted_blocks), i + 3)):
                             other_idx, other_block = sorted_blocks[j]

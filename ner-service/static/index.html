@@ -1,4 +1,3 @@
-cat << 'HTMLEOF' > ner-service/static/index.html
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -20,11 +19,13 @@ cat << 'HTMLEOF' > ner-service/static/index.html
         .sidebar h3 { margin-top: 0; margin-bottom: 10px; font-size: 18px; }
         .sidebar p { color: #64748b; font-size: 14px; margin-bottom: 15px; }
         .entities-list { flex: 1; overflow-y: auto; border-top: 1px solid #e2e8f0; padding-top: 10px; }
-        .entity-item { display: flex; align-items: flex-start; padding: 10px; border-radius: 6px; transition: background 0.2s; gap: 10px; margin-bottom: 5px; }
+        .category-section { margin-bottom: 20px; }
+        .category-section h4 { margin: 0 0 10px 0; font-size: 15px; color: #1e293b; border-bottom: 2px solid #e2e8f0; padding-bottom: 5px; }
+        .entity-item { display: flex; align-items: flex-start; padding: 8px; border-radius: 6px; transition: background 0.2s; gap: 10px; margin-bottom: 5px; }
         .entity-item:hover { background: #f8fafc; }
         .entity-item input[type="checkbox"] { margin-top: 4px; cursor: pointer; transform: scale(1.2); }
-        .entity-item label { cursor: pointer; flex: 1; font-size: 14px; line-height: 1.4; word-break: break-word; }
-        .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: 4px; margin-right: 6px; text-transform: uppercase; }
+        .entity-item label { cursor: pointer; flex: 1; font-size: 13px; line-height: 1.4; word-break: break-word; }
+        .badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; margin-right: 6px; text-transform: uppercase; }
         .badge-NAME { background: #fee2e2; color: #991b1b; }
         .badge-PASSPORT { background: #dbeafe; color: #1e40af; }
         .badge-MONEY_RUB { background: #dcfce7; color: #166534; }
@@ -149,29 +150,84 @@ cat << 'HTMLEOF' > ner-service/static/index.html
         
         container.appendChild(img);
 
+        // Группируем сущности по категориям
+        const categories = {};
         currentEntities.forEach((entity, index) => {
-            const item = document.createElement('div'); item.className = 'entity-item';
-            const checkbox = document.createElement('input');
-            checkbox.type = 'checkbox'; checkbox.checked = entity.is_masked; checkbox.id = `chk_${index}`;
-            checkbox.onchange = () => toggleEntity(index);
-            const label = document.createElement('label'); label.htmlFor = `chk_${index}`;
-            label.innerHTML = `<span class="badge badge-${entity.type}">${entity.type}</span> ${entity.text}`;
-            item.appendChild(checkbox); item.appendChild(label); list.appendChild(item);
+            if (!categories[entity.type]) {
+                categories[entity.type] = [];
+            }
+            categories[entity.type].push({entity, index});
         });
 
+        // Порядок категорий
+        const categoryOrder = ['NAME', 'PASSPORT', 'DATE', 'MONEY_RUB', 'SUBJECT', 'INN', 'OGRN', 'BANK_ACCOUNT'];
+        const categoryNames = {
+            'NAME': '👤 ФИО',
+            'PASSPORT': ' Паспорт',
+            'DATE': ' Даты',
+            'MONEY_RUB': '💰 Суммы',
+            'SUBJECT': '📋 Статьи долга',
+            'INN': '🏢 ИНН',
+            'OGRN': '🏢 ОГРН',
+            'BANK_ACCOUNT': ' Счета'
+        };
+
+        // Отображаем сгруппированные категории
+        categoryOrder.forEach(category => {
+            if (categories[category] && categories[category].length > 0) {
+                const section = document.createElement('div');
+                section.className = 'category-section';
+                
+                const title = document.createElement('h4');
+                title.textContent = `${categoryNames[category] || category} (${categories[category].length})`;
+                section.appendChild(title);
+                
+                categories[category].forEach(({entity, index}) => {
+                    const item = document.createElement('div');
+                    item.className = 'entity-item';
+                    
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.checked = entity.is_masked;
+                    checkbox.id = `chk_${index}`;
+                    checkbox.onchange = () => toggleEntity(index);
+                    
+                    const label = document.createElement('label');
+                    label.htmlFor = `chk_${index}`;
+                    label.innerHTML = `<span class="badge badge-${entity.type}">${entity.type}</span> ${entity.text}`;
+                    
+                    item.appendChild(checkbox);
+                    item.appendChild(label);
+                    section.appendChild(item);
+                });
+                
+                list.appendChild(section);
+            }
+        });
+
+        // Отображаем пары
         if (currentPairs.length > 0) {
             document.getElementById('pairsSection').style.display = 'block';
             currentPairs.forEach((pair, index) => {
-                const pairItem = document.createElement('div'); pairItem.className = 'pair-item';
+                const pairItem = document.createElement('div');
+                pairItem.className = 'pair-item';
+                
                 const checkbox = document.createElement('input');
-                checkbox.type = 'checkbox'; checkbox.checked = true; checkbox.id = `pair_chk_${index}`;
+                checkbox.type = 'checkbox';
+                checkbox.checked = true;
+                checkbox.id = `pair_chk_${index}`;
                 checkbox.onchange = () => togglePair(index);
-                const content = document.createElement('div'); content.className = 'pair-content';
+                
+                const content = document.createElement('div');
+                content.className = 'pair-content';
                 content.innerHTML = `
                     <div class="pair-subject">${pair.subject.text}</div>
                     <div class="pair-money">→ ${pair.money.text}</div>
                 `;
-                pairItem.appendChild(checkbox); pairItem.appendChild(content); pairsList.appendChild(pairItem);
+                
+                pairItem.appendChild(checkbox);
+                pairItem.appendChild(content);
+                pairsList.appendChild(pairItem);
             });
         }
 
@@ -210,8 +266,3 @@ cat << 'HTMLEOF' > ner-service/static/index.html
 </script>
 </body>
 </html>
-HTMLEOF
-
-docker cp ner-service/static/index.html ner_ner_service:/app/static/index.html
-docker compose restart ner-service
-sleep 3
