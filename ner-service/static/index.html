@@ -12,10 +12,10 @@
         .upload-area:hover, .upload-area.dragover { border-color: #3b82f6; background: #eff6ff; }
         .image-container { position: relative; display: inline-block; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
         .image-container img { display: block; max-width: 100%; height: auto; }
-        .bbox { position: absolute; border: 2px solid rgba(239, 68, 68, 0.8); background-color: rgba(239, 68, 68, 0.15); cursor: pointer; transition: all 0.2s ease; border-radius: 4px; }
-        .bbox:hover { border-color: #3b82f6; background-color: rgba(59, 130, 246, 0.2); z-index: 10; }
+        .bbox { position: absolute; border: 2px solid rgba(239, 68, 68, 0.8); background-color: rgba(239, 68, 68, 0.15); cursor: pointer; transition: all 0.2s ease; border-radius: 4px; z-index: 1; }
+        .bbox:hover { border-color: #3b82f6; background-color: rgba(59, 130, 246, 0.3); z-index: 100; }
         .bbox.masked { border: 2px solid #000; background-color: rgba(0, 0, 0, 0.85); }
-        .sidebar { flex: 1; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); display: flex; flex-direction: column; max-width: 450px; }
+        .sidebar { flex: 1; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); display: flex; flex-direction: column; max-width: 500px; }
         .sidebar h3 { margin-top: 0; margin-bottom: 10px; font-size: 18px; }
         .sidebar p { color: #64748b; font-size: 14px; margin-bottom: 15px; }
         .entities-list { flex: 1; overflow-y: auto; border-top: 1px solid #e2e8f0; padding-top: 10px; }
@@ -38,11 +38,34 @@
         .loader { display: none; text-align: center; padding: 20px; color: #64748b; font-size: 18px; }
         .pairs-section { border-top: 2px solid #e2e8f0; margin-top: 15px; padding-top: 15px; }
         .pairs-section h4 { margin: 0 0 10px 0; font-size: 16px; color: #1e293b; }
-        .pair-item { display: flex; align-items: flex-start; padding: 10px; border-radius: 6px; background: #f8fafc; margin-bottom: 8px; gap: 10px; }
+        .pair-item { display: flex; align-items: flex-start; padding: 10px; border-radius: 6px; background: #f8fafc; margin-bottom: 8px; gap: 10px; position: relative; }
+        .pair-item:hover { background: #e0f2fe; }
         .pair-item input[type="checkbox"] { margin-top: 4px; cursor: pointer; transform: scale(1.2); }
         .pair-content { flex: 1; font-size: 13px; line-height: 1.4; }
         .pair-subject { color: #6b21a8; font-weight: 600; margin-bottom: 4px; }
         .pair-money { color: #166534; font-weight: 600; }
+        .pair-context {
+            display: none;
+            position: absolute;
+            left: 100%;
+            top: 0;
+            background: #1e293b;
+            color: white;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            max-width: 300px;
+            z-index: 1000;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            margin-left: 10px;
+        }
+        .pair-item:hover .pair-context { display: block; }
+        .overlap-indicator {
+            font-size: 10px;
+            color: #64748b;
+            margin-left: 5px;
+            cursor: pointer;
+        }
     </style>
 </head>
 <body>
@@ -58,10 +81,10 @@
     </div>
     <div class="sidebar">
         <h3>🎯 Кандидаты на маскирование</h3>
-        <p>Снимите галочку, чтобы исключить из закрашивания.</p>
+        <p>Снимите галочку, чтобы исключить из закрашивания. <span class="overlap-indicator" title="Если области накладываются, кликните несколько раз чтобы переключить нужную">️</span></p>
         <div class="entities-list" id="entitiesList"><p style="text-align: center; color: #94a3b8; margin-top: 40px;">Загрузите документ</p></div>
         <div class="pairs-section" id="pairsSection" style="display: none;">
-            <h4>💰 Пары: предмет — сумма</h4>
+            <h4> Пары: предмет — сумма</h4>
             <div id="pairsList"></div>
         </div>
         <button class="btn" id="maskBtn" onclick="applyMasking()" disabled>Применить маскирование</button>
@@ -72,6 +95,8 @@
     let currentPairs = [];
     let originalImageWidth = 0;
     let originalImageHeight = 0;
+    let clickTimeout = null;
+    let pendingBboxes = [];
 
     const uploadArea = document.getElementById('uploadArea');
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => { uploadArea.addEventListener(eventName, (e) => { e.preventDefault(); e.stopPropagation(); }, false); });
@@ -106,32 +131,55 @@
         currentEntities = data.entities;
         currentPairs = data.subject_money_pairs || [];
         document.getElementById('loader').style.display = 'none';
-        
+
         const img = document.createElement('img');
         img.src = data.image_base64;
         img.onload = () => {
             originalImageWidth = img.naturalWidth;
             originalImageHeight = img.naturalHeight;
-            
+
+            // Группируем bbox по позициям для обработки перекрытий
+            const bboxGroups = {};
             currentEntities.forEach((entity, index) => {
-                const bbox = document.createElement('div');
-                bbox.className = 'bbox masked';
-                bbox.dataset.index = index;
-                
-                const scaleX = img.clientWidth / originalImageWidth;
-                const scaleY = img.clientHeight / originalImageHeight;
-                
-                bbox.style.left = (entity.bbox.x * scaleX) + 'px';
-                bbox.style.top = (entity.bbox.y * scaleY) + 'px';
-                bbox.style.width = (entity.bbox.w * scaleX) + 'px';
-                bbox.style.height = (entity.bbox.h * scaleY) + 'px';
-                
-                bbox.title = `${entity.type}: ${entity.text}`;
-                bbox.onclick = () => toggleEntity(index);
-                container.appendChild(bbox);
+                const key = `${entity.bbox.x}_${entity.bbox.y}`;
+                if (!bboxGroups[key]) bboxGroups[key] = [];
+                bboxGroups[key].push({entity, index});
+            });
+
+            // Создаем рамки
+            Object.values(bboxGroups).forEach(group => {
+                group.forEach(({entity, index}, groupIndex) => {
+                    const bbox = document.createElement('div');
+                    bbox.className = 'bbox masked';
+                    bbox.dataset.index = index;
+
+                    const scaleX = img.clientWidth / originalImageWidth;
+                    const scaleY = img.clientHeight / originalImageHeight;
+
+                    // Небольшой сдвиг для перекрывающихся областей
+                    const offset = group.length > 1 ? (groupIndex * 3) : 0;
+
+                    bbox.style.left = (entity.bbox.x * scaleX) + 'px';
+                    bbox.style.top = (entity.bbox.y * scaleY + offset) + 'px';
+                    bbox.style.width = (entity.bbox.w * scaleX) + 'px';
+                    bbox.style.height = (entity.bbox.h * scaleY) + 'px';
+
+                    if (group.length > 1) {
+                        bbox.title = `${entity.type}: ${entity.text}\n(Перекрывается с ${group.length-1} другими. Кликните несколько раз)`;
+                    } else {
+                        bbox.title = `${entity.type}: ${entity.text}`;
+                    }
+
+                    bbox.onclick = (e) => {
+                        e.stopPropagation();
+                        handleBboxClick(index, group, groupIndex);
+                    };
+
+                    container.appendChild(bbox);
+                });
             });
         };
-        
+
         window.addEventListener('resize', () => {
             if (img.complete) {
                 currentEntities.forEach((entity, index) => {
@@ -147,84 +195,81 @@
                 });
             }
         });
-        
+
         container.appendChild(img);
 
         // Группируем сущности по категориям
         const categories = {};
         currentEntities.forEach((entity, index) => {
-            if (!categories[entity.type]) {
-                categories[entity.type] = [];
-            }
+            if (!categories[entity.type]) categories[entity.type] = [];
             categories[entity.type].push({entity, index});
         });
 
-        // Порядок категорий
         const categoryOrder = ['NAME', 'PASSPORT', 'DATE', 'MONEY_RUB', 'SUBJECT', 'INN', 'OGRN', 'BANK_ACCOUNT'];
         const categoryNames = {
             'NAME': '👤 ФИО',
-            'PASSPORT': ' Паспорт',
-            'DATE': ' Даты',
+            'PASSPORT': '🛂 Паспорт',
+            'DATE': '📅 Даты',
             'MONEY_RUB': '💰 Суммы',
-            'SUBJECT': '📋 Статьи долга',
+            'SUBJECT': ' Статьи долга',
             'INN': '🏢 ИНН',
             'OGRN': '🏢 ОГРН',
-            'BANK_ACCOUNT': ' Счета'
+            'BANK_ACCOUNT': '💳 Счета'
         };
 
-        // Отображаем сгруппированные категории
         categoryOrder.forEach(category => {
             if (categories[category] && categories[category].length > 0) {
                 const section = document.createElement('div');
                 section.className = 'category-section';
-                
+
                 const title = document.createElement('h4');
                 title.textContent = `${categoryNames[category] || category} (${categories[category].length})`;
                 section.appendChild(title);
-                
+
                 categories[category].forEach(({entity, index}) => {
                     const item = document.createElement('div');
                     item.className = 'entity-item';
-                    
+
                     const checkbox = document.createElement('input');
                     checkbox.type = 'checkbox';
                     checkbox.checked = entity.is_masked;
                     checkbox.id = `chk_${index}`;
                     checkbox.onchange = () => toggleEntity(index);
-                    
+
                     const label = document.createElement('label');
                     label.htmlFor = `chk_${index}`;
                     label.innerHTML = `<span class="badge badge-${entity.type}">${entity.type}</span> ${entity.text}`;
-                    
+
                     item.appendChild(checkbox);
                     item.appendChild(label);
                     section.appendChild(item);
                 });
-                
+
                 list.appendChild(section);
             }
         });
 
-        // Отображаем пары
+        // Отображаем пары с контекстом
         if (currentPairs.length > 0) {
             document.getElementById('pairsSection').style.display = 'block';
             currentPairs.forEach((pair, index) => {
                 const pairItem = document.createElement('div');
                 pairItem.className = 'pair-item';
-                
+
                 const checkbox = document.createElement('input');
                 checkbox.type = 'checkbox';
                 checkbox.checked = true;
                 checkbox.id = `pair_chk_${index}`;
                 checkbox.onchange = () => togglePair(index);
-                
+
                 const content = document.createElement('div');
                 content.className = 'pair-content';
                 content.innerHTML = `
                     <div class="pair-subject">${pair.subject.text}</div>
                     <div class="pair-money">→ ${pair.money.text}</div>
+                    ${pair.context ? `<div class="pair-context"><strong>Контекст:</strong><br>${pair.context}</div>` : ''}
                 `;
-                
+
                 pairItem.appendChild(checkbox);
                 pairItem.appendChild(content);
                 pairsList.appendChild(pairItem);
@@ -232,6 +277,27 @@
         }
 
         document.getElementById('maskBtn').disabled = false;
+    }
+
+    function handleBboxClick(index, group, groupIndex) {
+        // Обработка перекрывающихся областей — циклическое переключение
+        if (clickTimeout) {
+            clearTimeout(clickTimeout);
+        }
+
+        clickTimeout = setTimeout(() => {
+            const entity = currentEntities[index];
+            entity.is_masked = !entity.is_masked;
+
+            const checkbox = document.getElementById(`chk_${index}`);
+            if (checkbox) checkbox.checked = entity.is_masked;
+
+            const bbox = document.querySelector(`.bbox[data-index="${index}"]`);
+            if (bbox) entity.is_masked ? bbox.classList.add('masked') : bbox.classList.remove('masked');
+
+            clickTimeout = null;
+            pendingBboxes = [];
+        }, 250);
     }
 
     function toggleEntity(index) {
@@ -247,9 +313,18 @@
         const pair = currentPairs[index];
         const checkbox = document.getElementById(`pair_chk_${index}`);
         const isMasked = checkbox.checked;
-        
+
+        // Находим и переключаем SUBJECT
         currentEntities.forEach((entity, idx) => {
-            if (entity.id === pair.subject.id || entity.id === pair.money.id) {
+            if (entity.id === pair.subject.id) {
+                entity.is_masked = isMasked;
+                const chk = document.getElementById(`chk_${idx}`);
+                if (chk) chk.checked = isMasked;
+                const bbox = document.querySelector(`.bbox[data-index="${idx}"]`);
+                if (bbox) isMasked ? bbox.classList.add('masked') : bbox.classList.remove('masked');
+            }
+            // Находим и переключаем MONEY
+            if (entity.id === pair.money.id) {
                 entity.is_masked = isMasked;
                 const chk = document.getElementById(`chk_${idx}`);
                 if (chk) chk.checked = isMasked;
