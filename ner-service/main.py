@@ -270,10 +270,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
 
     for match in date_extractor(text):
         add_entity(text[match.start:match.stop], 'DATE', match.start, match.stop, 0.95)
-    for pattern in [re.compile(r'\b\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}(?![/\d])\b'),
-                    re.compile(
-                        r'["\']?\d{1,2}["\']?\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{2,4}\s*г\.?',
-                        re.IGNORECASE)]:
+    for pattern in [re.compile(r'\b\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}\b'), re.compile(r'["\']?\d{1,2}["\']?\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{2,4}\s*г\.?', re.IGNORECASE)]:
         for match in pattern.finditer(text):
             add_entity(match.group(0), 'DATE', match.start(), match.end(), 0.95)
 
@@ -394,9 +391,7 @@ def match_ner_to_ocr(ner_entities: list, ocr_blocks: list, full_text: str) -> li
             if target_words:
                 for i, (idx, block) in enumerate(sorted_blocks):
                     block_words = set(re.findall(r'\w+', block['text'].lower()))
-                    # Требует хотя бы 50% совпадения значимых слов
-                    overlap = target_words & block_words
-                    if overlap and len(overlap) >= len(target_words) * 0.5:
+                    if target_words & block_words:
                         # Проверяем соседние блоки для многословных сущностей
                         covered_indices = [idx]
                         for j in range(max(0, i - 2), min(len(sorted_blocks), i + 3)):
