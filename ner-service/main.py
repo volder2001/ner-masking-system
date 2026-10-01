@@ -616,7 +616,7 @@ async def analyze_document(file: UploadFile = File(...)):
 
             pairs_for_json.append({
                 "subject": {
-                    "id": subject_id,
+                    "id": subject_ids,
                     "type": pair.subject.type,
                     "text": pair.subject.text,
                     "normal_form": pair.subject.normal_form
