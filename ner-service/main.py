@@ -307,6 +307,7 @@ def extract_entities(text: str) -> Tuple[List[Entity], Dict]:
     # 1. SUBJECT / NOT_SUBJECT через ЧИСТЫЙ YARGY
     for match in DICT_PARSER.findall(resolution_text):
         matched_text = resolution_text[match.span.start:match.span.stop]
+        print(matched_text)
 
         # Определяем категорию через лемматизацию (это надежно и использует силу yargy для поиска)
         category = get_category_for_matched_text(matched_text)
