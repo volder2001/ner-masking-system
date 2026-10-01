@@ -592,7 +592,7 @@ async def analyze_document(file: UploadFile = File(...)):
     maskable_types = {'NAME', 'PASSPORT', 'MONEY_RUB', 'SUBJECT', 'INN', 'BANK_ACCOUNT', 'DATE'}
     filtered_ner = [e for e in ner_entities if e.type in maskable_types]
 
-    # 4. Сопоставляем NER-сущности с OCR-блоками
+
     # 4. Сопоставляем NER-сущности с OCR-блоками (улучшенная версия)
     matched_entities = match_ner_to_ocr(filtered_ner, ocr_blocks, full_text)
 
