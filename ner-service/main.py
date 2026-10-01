@@ -615,6 +615,8 @@ async def analyze_document(file: UploadFile = File(...)):
             ]
 
 
+            fake_var = 0
+            fake_var = 1
 
             pairs_for_json.append({
                 "subject": {
