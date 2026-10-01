@@ -614,6 +614,8 @@ async def analyze_document(file: UploadFile = File(...)):
                 if e["text"] == pair.money.text and e["type"] == pair.money.type
             ]
 
+
+
             pairs_for_json.append({
                 "subject": {
                     "id": subject_ids,
