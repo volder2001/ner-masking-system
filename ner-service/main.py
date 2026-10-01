@@ -622,7 +622,7 @@ async def analyze_document(file: UploadFile = File(...)):
                     "normal_form": pair.subject.normal_form
                 },
                 "money": {
-                    "id": money_id,
+                    "id": money_ids,
                     "type": pair.money.type,
                     "text": pair.money.text,
                     "normal_form": pair.money.normal_form
