@@ -601,6 +601,7 @@ async def analyze_document(file: UploadFile = File(...)):
 
 
     # Конвертируем пары в словари для JSON
+    # Конвертируем пары в словари для JSON
     pairs_for_json = []
     for pair in subject_money_pairs:
         if pair.money is not None:
@@ -614,25 +615,20 @@ async def analyze_document(file: UploadFile = File(...)):
                 if e["text"] == pair.money.text and e["type"] == pair.money.type
             ]
 
-
-            fake_var = 0
-            fake_var = 1
-            fake_var = 2
-
             pairs_for_json.append({
                 "subject": {
-                    "id": subject_ids,
+                    "ids": subject_ids,  # <-- Теперь список ID
                     "type": pair.subject.type,
                     "text": pair.subject.text,
                     "normal_form": pair.subject.normal_form
                 },
                 "money": {
-                    "id": money_ids,
+                    "ids": money_ids,  # <-- Теперь список ID
                     "type": pair.money.type,
                     "text": pair.money.text,
                     "normal_form": pair.money.normal_form
                 },
-                "context": pair.context  # <-- ДОБАВЛЕН КОНТЕКСТ
+                "context": pair.context if hasattr(pair, 'context') else None
             })
 
 
